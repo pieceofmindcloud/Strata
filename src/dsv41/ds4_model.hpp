@@ -57,6 +57,7 @@ struct Options {
     // heads, of the output projection and of every expert's FFN, summed through host-mapped memory (a GPU unlike the
     // next stays alone); tp > 1 runs with threads (--tp 1 --threads off: one host thread, layer split only)
     int tp = 2;
+    bool stage_split = false;         // a stage of a split across processes (ds4_stage.hpp): smaller prompt chunks
     bool threads = false;             // a host thread per GPU enqueues its layers (the hand-offs host-mapped)
     // prompts in chunks of this many tokens through each layer at once (threads): the GEMMs on the tensor cores, the
     // CPU lane's experts streamed to the GPUs a chunk at a time instead of computed on the host; 0: windows of 16;
@@ -157,6 +158,13 @@ public:
     const std::vector<int32_t>& tokens() const;   // what the state has consumed, in order
 
     void reset();
+    /// A split across processes (ds4_stage.hpp), called after load(). `earlier`: this stage hands on to a next one.
+    bool stage_begin(bool earlier, bool has_prev, std::string& err);
+    void set_stage_prev(std::function<bool(const int*, int, int64_t, float*, std::string&)> rows);
+    void set_stage_sync(std::function<bool(char, int64_t)> sync);
+    size_t stage_row_floats() const;
+    /// Runs this stage's layers on the next window and writes h | pre to `rows` (T * stage_row_floats()).
+    bool stage_forward(const int* tokens, int T, float* rows, std::string& err);
     /// Keep the state at the current position in checkpoint slot 0 or 1 (the end of a prompt, the position before it);
     /// restore(limit) goes back to the latest one at or before limit (-1: none).
     void checkpoint(int slot = 0);

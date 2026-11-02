@@ -865,6 +865,9 @@ struct WinPlan {
 }  // namespace
 
 // ------------------------------------------------------------------ the model
+// A stage link's frame is at most 64 MiB (the POM relay's limit): 512 rows of h | pre are about 42 MiB.
+static constexpr int kStageMaxChunk = 512;
+
 struct Model::Impl {
     Options o;
     Pack pk;
@@ -2229,6 +2232,7 @@ struct Model::Impl {
         if (const char* v = std::getenv("DS4_CHUNK_MIN")) chunk_min = std::max(1, std::atoi(v));
         if (chunk > 0) {
             chunk = std::min(kMaxChunk, std::max(dc != nullptr ? 16 : 256, chunk / 16 * 16));
+            if (o.stage_split) chunk = std::min(chunk, kStageMaxChunk);
             eg_cap = (size_t) chunk;
             tap_cap = std::max(kWin, 128);
         } else   // (only as asked for: --prefill-chunk 0, or --tp 1 with --threads off)
@@ -5475,6 +5479,7 @@ struct Model::Impl {
     }
 
     void reset() {
+        stage_call('Z', 0);
         pos = 0;
         toks.clear();
         ctoks.clear();
@@ -5498,6 +5503,7 @@ struct Model::Impl {
     // the state at pos into checkpoint `slot` (the window rings and the compressors' partial groups: the rest of the
     // state is indexed by position, and what lies past a restored position is written again)
     void checkpoint(int slot) {
+        stage_call('K', slot);
         Check& c = ck[slot & (kChecks - 1)];
         c.pos = pos;
         c.win.resize(L.size());
@@ -5536,6 +5542,7 @@ struct Model::Impl {
 
     // checkpoint 1 (the position before the last prompt's end) becomes the anchor too
     void pin() {
+        stage_call('N', 0);
         if (ck[1].pos > 0) ck[2] = ck[1];
     }
     // the checkpoints the state can go back to (what a slot of it keeps), latest first
@@ -5562,6 +5569,14 @@ struct Model::Impl {
     }
 
     bool restore(int64_t limit) {
+        if (!stage_call('B', limit)) return false;
+        const bool muted = stage_sync_muted;
+        stage_sync_muted = true;
+        const bool ok = restore_local(limit);
+        stage_sync_muted = muted;
+        return ok;
+    }
+    bool restore_local(int64_t limit) {
         const int b = best_check(limit);
         if (b < 0) return false;
         const Check& c = ck[b];
@@ -8520,7 +8535,14 @@ struct Model::Impl {
                 if (mi < 0) continue;
                 if (!started) {   // the chunk's input: its embedding rows, or the previous group's hand-off
                     started = true;
-                    if (il == 0) {
+                    if (il == 0 && stage_prev) {   // the earlier stage's rows for this chunk
+                        std::vector<float> rows((size_t) T * stage_row_floats());
+                        if (!stage_prev(toks.data() + p0, T, p0, rows.data(), err)) return false;
+                        const size_t nh = (size_t) T * H * D;
+                        CK(cudaMemcpyAsync(c.h, rows.data(), nh * 4, cudaMemcpyHostToDevice, s));
+                        CK(cudaMemcpyAsync(c.pre, rows.data() + nh, (size_t) T * 8 * 4, cudaMemcpyHostToDevice, s));
+                        CK(cudaStreamSynchronize(s));
+                    } else if (il == 0) {
                         if (k >= 2) CK(cudaEventSynchronize(c.emb_ev[slot]));
                         for (int t = 0; t < T; ++t)
                             std::memcpy(c.emb_host[slot] + (size_t) t * D, emb_row(p0 + t, toks[(size_t) (p0 + t)]),
@@ -8582,6 +8604,12 @@ struct Model::Impl {
                     if (k >= 2) wait_flags(c.hand_ack + (size_t) slot * 8 * 32, nnext, 32, wp.win - 2, s);
                     xfer_put(chunk_xfer(c.hand[slot], c, T, true), c.hand_flag[slot], wp.win, d.xcnt, s);
                 }
+            }
+            if (stage_out != nullptr && di == L[(size_t) g.nl - 1].dev) {   // (one chunk: stage_forward's piece)
+                const size_t nh = (size_t) T * H * D;
+                CK(cudaMemcpyAsync(stage_out, c.h, nh * 4, cudaMemcpyDeviceToHost, s));
+                CK(cudaMemcpyAsync(stage_out + nh, c.pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToHost, s));
+                CK(cudaStreamSynchronize(s));
             }
             if (di == head_dev && (size_t) k < chunk_done.size()) {
                 CK(cudaEventRecord(chunk_done[(size_t) k], s));
@@ -8909,6 +8937,7 @@ struct Model::Impl {
     // the largest layer's experts read from the files if RAM allows (ram_avail() less kRamMargin; DS4_LAYER_CACHE_MB
     // sets it) - at least one expert, or not layer-major
     bool lm_begin(const Run& run) {
+        if (stage_split()) return false;   // (a chunk's rows come and go whole, chunk after chunk)
         static const char* env = std::getenv("DS4_LAYER_MAJOR");
         if (devs.size() != 1 || run.T.size() < 2 || (env != nullptr && std::atoi(env) == 0)) return false;
         Chunk& c = *chunks[0];
@@ -9411,6 +9440,18 @@ struct Model::Impl {
         return true;
     }
 
+    // A split across processes (ds4_stage.hpp). stage_prev: the earlier stage's h | pre for a window; stage_out: where
+    // this stage hands on its own, instead of running the head; stage_sync mirrors a state call on the earlier stage.
+    std::function<bool(const int*, int, int64_t, float*, std::string&)> stage_prev;
+    std::function<bool(char, int64_t)> stage_sync;
+    bool stage_sync_muted = false;
+    float* stage_out = nullptr;
+    std::vector<float> stage_in;
+    bool stage_split() const { return (bool) stage_prev || stage_is_earlier; }
+    bool stage_is_earlier = false;
+    size_t stage_row_floats() const { return (size_t) g.hc * g.dim + 8; }
+    bool stage_call(char op, int64_t arg) { return !stage_sync || stage_sync_muted || stage_sync(op, arg); }
+
     bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1) {
 #if defined(STRATA_METAL)
         struct BusyAll {   // DS4_BUSY_ALL: the GPU is held busy for the whole step (the host gaps between its bursts too)
@@ -9455,6 +9496,10 @@ struct Model::Impl {
         prof_window = prof_on && T == 1;
         n_logits = std::min(logits_rows, T);
         const double tl = now_ms();
+        if (stage_prev) {
+            stage_in.resize((size_t) T * stage_row_floats());
+            if (!stage_prev(tk, T, p0, stage_in.data(), err)) return false;
+        }
         if (par) {
             if (!forward_par(p0, T, err)) return false;
         } else if (!forward_serial(p0, T, err)) return false;
@@ -9496,7 +9541,14 @@ struct Model::Impl {
         const int D = g.dim, H = g.hc;
         int cur = L[0].dev;
         if (ds4_dbg("DS4_SYNC_WIN")) cudaDeviceSynchronize();
-        {
+        if (stage_prev) {   // the earlier stage's hand-off: this slice starts at a source, so h | pre is all it needs
+            Dev& d = devs[(size_t) cur];
+            cudaSetDevice(d.id);
+            const size_t nh = (size_t) T * H * D, np = (size_t) T * 8;
+            CK(cudaMemcpyAsync(d.h, stage_in.data(), nh * 4, cudaMemcpyHostToDevice, d.st));
+            CK(cudaMemcpyAsync(d.pre, stage_in.data() + nh, np * 4, cudaMemcpyHostToDevice, d.st));
+            CK(cudaStreamSynchronize(d.st));
+        } else {
             Dev& d = devs[(size_t) cur];
             cudaSetDevice(d.id);
             CK(emb_upload(d.emb_rows, h_emb, (size_t) T * D * 2, d.st));
@@ -9550,6 +9602,15 @@ struct Model::Impl {
             }
         }
         if (dump_h != nullptr) std::fwrite(dump.data(), 4, dump.size(), dump_h);
+        if (stage_out != nullptr) {   // an earlier stage: the rows go to the next stage, the head is not this one's
+            Dev& d = devs[(size_t) cur];
+            cudaSetDevice(d.id);
+            const size_t nh = (size_t) T * H * D, np = (size_t) T * 8;
+            CK(cudaMemcpyAsync(stage_out, d.h, nh * 4, cudaMemcpyDeviceToHost, d.st));
+            CK(cudaMemcpyAsync(stage_out + nh, d.pre, np * 4, cudaMemcpyDeviceToHost, d.st));
+            CK(cudaStreamSynchronize(d.st));
+            return true;
+        }
         if (cur != head_dev) {
             err = "the head is not on the last layer's GPU";
             return false;
@@ -9608,7 +9669,12 @@ struct Model::Impl {
             if (mi < 0) continue;
             if (!started) {   // the window's input: the embedding rows, or the previous group's hand-off
                 started = true;
-                if (il == 0) {
+                if (il == 0 && stage_prev) {   // the earlier stage's hand-off (forward() fetched it)
+                    const size_t nh = (size_t) T * H * D;
+                    CK(cudaMemcpyAsync(d.h, stage_in.data(), nh * 4, cudaMemcpyHostToDevice, s));
+                    CK(cudaMemcpyAsync(d.pre, stage_in.data() + nh, (size_t) T * 8 * 4, cudaMemcpyHostToDevice, s));
+                    CK(cudaStreamSynchronize(s));
+                } else if (il == 0) {
                     CK(emb_upload(d.emb_rows, h_emb, (size_t) T * D * 2, s));
                     embed(d.emb_rows, T, d.h, D, H, s);
                     if (ds4_dbg("DS4_DBG_EMB")) {
@@ -9651,6 +9717,15 @@ struct Model::Impl {
             if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, il, p0, T);
             const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
             if (last && mi == 0 && il + 1 < g.nl) xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
+        }
+        if (stage_out != nullptr) {   // an earlier stage: the rows go on to the next stage, the head is not this one's
+            if (di == L[(size_t) g.nl - 1].dev) {
+                const size_t nh = (size_t) T * H * D;
+                CK(cudaMemcpyAsync(stage_out, d.h, nh * 4, cudaMemcpyDeviceToHost, s));
+                CK(cudaMemcpyAsync(stage_out + nh, d.pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToHost, s));
+                CK(cudaStreamSynchronize(s));
+            }
+            return true;
         }
         if (d.grp == devs[(size_t) head_dev].grp) return head_rows_dev(di, T, err);
         return true;
@@ -10439,6 +10514,11 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
     p.pm.last = -1;
     p.halted = false;
     const double t0 = now_ms();
+    if (p.stage_split() && n >= 2) {   // (the checkpoint the earlier stage has to take too: a call of its own)
+        if (!feed(tokens, n - 1, 0, err)) return false;
+        p.checkpoint(slot);
+        return feed(tokens + n - 1, 1, logits_rows, err);
+    }
     if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && p.pick_path(n)) {   // (the last token rides along; its layers
         const bool ok = p.forward_chunks(tokens, n, logits_rows, err, slot);   // keep the state before it)
         if (ok) p.path_done(now_ms() - t0);
@@ -10482,13 +10562,59 @@ int64_t Model::max_context() const { return p_->o.max_context; }
 int Model::vocab() const { return p_->g.vocab; }
 const std::vector<int32_t>& Model::tokens() const { return p_->toks; }
 void Model::reset() { p_->reset(); }
+bool Model::stage_begin(bool earlier, bool has_prev, std::string& err) {
+    Impl& p = *p_;
+    (void) has_prev;
+    if (p.g.n_mtp > 0) {
+        err = "the drafter is not supported on a split model yet";
+        return false;
+    }
+    p.stage_is_earlier = earlier;
+    return true;
+}
+void Model::set_stage_prev(std::function<bool(const int*, int, int64_t, float*, std::string&)> rows) {
+    p_->stage_prev = std::move(rows);
+}
+void Model::set_stage_sync(std::function<bool(char, int64_t)> sync) { p_->stage_sync = std::move(sync); }
+size_t Model::stage_row_floats() const { return p_->stage_row_floats(); }
+bool Model::stage_forward(const int* tokens, int T, float* rows, std::string& err) {
+    // Piece by piece, each through the path its size takes; `rows` is every h, then every pre.
+    Impl& p = *p_;
+    p.logits_all = false;
+    const size_t hd = (size_t) p.g.hc * p.g.dim;
+    const int unit = p.chunk > 0 ? p.chunk : kWin;
+    std::vector<float> piece;
+    bool ok = true;
+    for (int a = 0; ok && a < T;) {
+        const int n = std::min(T - a, unit);
+        piece.resize((size_t) n * (hd + 8));
+        p.stage_out = piece.data();
+        ok = n > kWin ? p.forward_chunks(tokens + a, n, 0, err) : p.forward(tokens + a, n, 0, err, 0);
+        p.stage_out = nullptr;
+        if (!ok) break;
+        std::memcpy(rows + (size_t) a * hd, piece.data(), (size_t) n * hd * 4);
+        std::memcpy(rows + (size_t) T * hd + (size_t) a * 8, piece.data() + (size_t) n * hd, (size_t) n * 8 * 4);
+        a += n;
+    }
+    return ok;
+}
 void Model::checkpoint(int slot) { p_->checkpoint(slot); }
 bool Model::restore(int64_t limit) { return p_->restore(limit); }
 void Model::pin() { p_->pin(); }
 std::vector<int64_t> Model::check_positions() const { return p_->check_positions(); }
 int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }
-uint64_t Model::slot_save(std::vector<uint8_t>& out, std::string& err) { return p_->slot_save(out, err); }
+uint64_t Model::slot_save(std::vector<uint8_t>& out, std::string& err) {
+    if (p_->stage_split()) {   // (the other stage holds its share of the state)
+        err = "a session of a split model is not saved";
+        return 0;
+    }
+    return p_->slot_save(out, err);
+}
 bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {
+    if (p_->stage_split()) {
+        err = "a session of a split model is not restored";
+        return false;
+    }
     return p_->slot_load(data, bytes, n_pos, err);
 }
 std::string Model::slot_identity() const { return p_->slot_identity(); }
