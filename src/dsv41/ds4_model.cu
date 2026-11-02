@@ -7777,6 +7777,7 @@ struct Model::Impl {
     // (the compressed KV and the index keys past them are written again when those positions come)
     void rollback(int64_t p0, int T, int keep) {
         if (keep >= T) return;
+        stage_call('T', ((int64_t) T << 32) | (int64_t) keep);   // (the earlier stage ran the drafts too)
         // the ring rows: one launch a device for all its layers (a launch a layer and member was ~300 on 8-way tensor
         // parallel, a millisecond of the host's before the next draft)
         std::vector<RingBatch> rb(devs.size());
@@ -8539,7 +8540,7 @@ struct Model::Impl {
                     started = true;
                     if (il == 0 && stage_prev) {   // the earlier stage's rows for this chunk
                         std::vector<float> rows((size_t) T * stage_row_floats());
-                        if (!stage_prev(toks.data() + p0, T, p0, rows.data(), err)) return false;
+                        if (!stage_prev(toks.data() + p0, T, p0, false, rows.data(), err)) return false;
                         const size_t nh = (size_t) T * H * D;
                         CK(cudaMemcpyAsync(c.h, rows.data(), nh * 4, cudaMemcpyHostToDevice, s));
                         CK(cudaMemcpyAsync(c.pre, rows.data() + nh, (size_t) T * 8 * 4, cudaMemcpyHostToDevice, s));
@@ -9444,7 +9445,7 @@ struct Model::Impl {
 
     // A split across processes (ds4_stage.hpp). stage_prev: the earlier stage's h | pre for a window; stage_out: where
     // this stage hands on its own, instead of running the head; stage_sync mirrors a state call on the earlier stage.
-    std::function<bool(const int*, int, int64_t, float*, std::string&)> stage_prev;
+    std::function<bool(const int*, int, int64_t, bool, float*, std::string&)> stage_prev;
     std::function<bool(char, int64_t)> stage_sync;
     bool stage_sync_muted = false;
     float* stage_out = nullptr;
@@ -9500,7 +9501,7 @@ struct Model::Impl {
         const double tl = now_ms();
         if (stage_prev) {
             stage_in.resize((size_t) T * stage_row_floats());
-            if (!stage_prev(tk, T, p0, stage_in.data(), err)) return false;
+            if (!stage_prev(tk, T, p0, spec_win, stage_in.data(), err)) return false;
         }
         if (par) {
             if (!forward_par(p0, T, err)) return false;
@@ -10567,22 +10568,31 @@ void Model::reset() { p_->reset(); }
 bool Model::stage_begin(bool earlier, bool has_prev, std::string& err) {
     Impl& p = *p_;
     (void) has_prev;
-    if (p.g.n_mtp > 0) {
-        err = "the drafter is not supported on a split model yet";
+    if (earlier && p.g.n_mtp > 0) {   // (it reads the layers before the head: only the last stage has them)
+        err = "the DSpark drafter belongs to the last stage of a split";
         return false;
     }
     p.stage_is_earlier = earlier;
     return true;
 }
-void Model::set_stage_prev(std::function<bool(const int*, int, int64_t, float*, std::string&)> rows) {
+void Model::set_stage_prev(std::function<bool(const int*, int, int64_t, bool, float*, std::string&)> rows) {
     p_->stage_prev = std::move(rows);
 }
 void Model::set_stage_sync(std::function<bool(char, int64_t)> sync) { p_->stage_sync = std::move(sync); }
 size_t Model::stage_row_floats() const { return p_->stage_row_floats(); }
-bool Model::stage_forward(const int* tokens, int T, float* rows, std::string& err) {
+void Model::stage_rollback(int T, int keep) { p_->rollback(p_->pos - T, T, keep); }
+bool Model::stage_forward(const int* tokens, int T, float* rows, bool spec, std::string& err) {
     // Piece by piece, each through the path its size takes; `rows` is every h, then every pre.
     Impl& p = *p_;
     p.logits_all = false;
+    if (spec) {   // a draft's verification, one window: its backups let the rejected rows go back
+        p.stage_out = rows;
+        p.spec_win = true;
+        const bool ok = p.forward(tokens, T, 0, err, 0);
+        p.spec_win = false;
+        p.stage_out = nullptr;
+        return ok;
+    }
     const size_t hd = (size_t) p.g.hc * p.g.dim;
     const int unit = p.chunk > 0 ? p.chunk : kWin;
     std::vector<float> piece;

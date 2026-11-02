@@ -160,11 +160,13 @@ public:
     void reset();
     /// A split across processes (ds4_stage.hpp), called after load(). `earlier`: this stage hands on to a next one.
     bool stage_begin(bool earlier, bool has_prev, std::string& err);
-    void set_stage_prev(std::function<bool(const int*, int, int64_t, float*, std::string&)> rows);
+    void set_stage_prev(std::function<bool(const int*, int, int64_t, bool, float*, std::string&)> rows);
     void set_stage_sync(std::function<bool(char, int64_t)> sync);
     size_t stage_row_floats() const;
     /// Runs this stage's layers on the next window and writes h | pre to `rows` (T * stage_row_floats()).
-    bool stage_forward(const int* tokens, int T, float* rows, std::string& err);
+    /// `spec`: a draft's verification, which stage_rollback may take back in part.
+    bool stage_forward(const int* tokens, int T, float* rows, bool spec, std::string& err);
+    void stage_rollback(int T, int keep);
     /// Keep the state at the current position in checkpoint slot 0 or 1 (the end of a prompt, the position before it);
     /// restore(limit) goes back to the latest one at or before limit (-1: none).
     void checkpoint(int slot = 0);

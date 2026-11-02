@@ -212,8 +212,9 @@ the Qwen layer split described above. On four Radeon AI PRO R9700 cards it reach
 A split across processes is its own path (`--stage-serve HOST:PORT` on the earlier stage, `--stage-prev HOST:PORT` on the
 later one, both with `STRATA_STAGE_TOKEN`; `src/dsv41/ds4_stage.hpp`). Each process runs one slice whose blocks and source
 lists are renumbered from 0, and hands on `h | pre`. A slice can only start at a layer that is a KV, index and candidate
-source, after every Engram layer. Saved sessions and the drafter are off on it. **Its output has not been compared with the
-whole model's yet.**
+source, after every Engram layer. Saved sessions are off on it. The DSpark drafter stays on the last stage, with the layers
+it reads and the head; a verification window goes to the earlier stage too, which takes the rejected rows back. **Its output
+has not been compared with the whole model's yet.**
 
 ## Limits
 
