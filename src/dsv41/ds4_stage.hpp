@@ -49,6 +49,9 @@ inline int serve(Model& m, const std::string& addr, const std::string& token) {
         return 1;
     }
     const size_t row = m.stage_row_floats();
+    // (the line a supervisor waits for, as the other engine's stage server prints it: the port it is reached on)
+    std::fprintf(stderr, "maya-ds4: stage listening on %s (port %d), %zu floats a row\n", addr.c_str(), bound, row);
+    std::fflush(stderr);
     std::printf("READY stage\n");
     std::fflush(stdout);
     std::vector<char> req, ans;
