@@ -18,6 +18,11 @@
 //                                      every h, then every pre, so that a frame stays under the relay's 64 MiB)
 // Frames are the POM's envelope of stage_link.hpp; an answer starts with a status byte (0 ok, 1 error + message) and
 // its rows go as a tensor, so the node between the machines carries them in the deployment's hidden-state precision.
+//
+// The DSpark drafter stays on the last stage: it reads layers 37-39 and borrows the head. A verification window comes
+// as 'V', and 'T' takes its rejected rows back, as on the serving stage:
+//   'V' i64 pos0, u32 T, i32 tok[T] -> f32 rows[T * row_floats]
+//   'T' i64 (T << 32 | keep)        -> (the window's first `keep` rows stay)
 #pragma once
 
 #include <cstdint>
@@ -87,7 +92,11 @@ inline int serve(Model& m, const std::string& addr, const std::string& token) {
                 int64_t limit = 0;
                 ok = sl::get(req, at, limit);
                 if (ok) sl::put(ans, (uint8_t) (m.restore(limit) ? 1 : 0));
-            } else if (op == 'W') {
+            } else if (op == 'T') {
+                int64_t both = 0;
+                ok = sl::get(req, at, both);
+                if (ok) m.stage_rollback((int) (both >> 32), (int) (both & 0x7fffffff));
+            } else if (op == 'W' || op == 'V') {
                 int64_t pos0 = 0;
                 uint32_t T = 0;
                 ok = sl::get(req, at, pos0) && sl::get(req, at, T) && req.size() == at + (size_t) T * 4;
@@ -99,7 +108,7 @@ inline int serve(Model& m, const std::string& addr, const std::string& token) {
                     toks.resize(T);
                     if (T > 0) std::memcpy(toks.data(), req.data() + at, (size_t) T * 4);
                     rows.resize((size_t) T * row);
-                    ok = m.stage_forward(toks.data(), (int) T, rows.data(), why);
+                    ok = m.stage_forward(toks.data(), (int) T, rows.data(), op == 'V', why);
                 }
                 if (ok) {
                     tensor_from = 1;
@@ -140,8 +149,8 @@ public:
         }
         return simple('Z', 0, false, err);
     }
-    bool rows(const int* tokens, int T, int64_t pos0, float* out, std::string& err) {
-        std::vector<char> req{'W'}, ans;
+    bool rows(const int* tokens, int T, int64_t pos0, bool spec, float* out, std::string& err) {
+        std::vector<char> req{spec ? 'V' : 'W'}, ans;
         sl::put(req, pos0);
         sl::put(req, (uint32_t) T);
         sl::put_bytes(req, tokens, (size_t) T * 4);
@@ -156,7 +165,7 @@ public:
     }
     /// The state call the serving stage just made. 'B' answers whether it restored.
     bool sync(char op, int64_t arg, std::string& err) {
-        return simple(op, arg, op == 'K' || op == 'B', err);
+        return simple(op, arg, op == 'K' || op == 'B' || op == 'T', err);
     }
 
 private:

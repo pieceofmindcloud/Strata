@@ -721,6 +721,15 @@ def main() -> int:
             v = dg.kv.get("dflash." + dk)
             if v is not None:
                 kv.setdefault("%s.dspark.%s" % (arch, k), v)
+        # a slice (pom.start_layer: its blocks renumbered from 0): the layers the drafter reads, in its own numbers
+        start = kv.get("pom.start_layer")
+        if start is not None and kv.get("%s.dspark.target_layers" % arch) is not None:
+            if int(kv["pom.end_layer"]) + 1 != int(kv["pom.original_block_count"]):
+                raise SystemExit("the DSpark drafter belongs to the last slice, with the head")
+            targets = [int(t) - int(start) for t in kv["%s.dspark.target_layers" % arch]]
+            if min(targets) < 0:
+                raise SystemExit("the DSpark drafter reads a layer before this slice: %r" % (targets,))
+            kv["%s.dspark.target_layers" % arch] = targets
         if a.dspark_noise_token is not None:
             kv.setdefault("%s.dspark.noise_token_id" % arch, int(a.dspark_noise_token))
         if a.dspark_markov_rank is not None:

@@ -1401,8 +1401,8 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
                 return 1;
             }
-            m.set_stage_prev([&stage_link](const int* tk, int T, int64_t pos0, float* rows, std::string& e) {
-                return stage_link.rows(tk, T, pos0, rows, e);
+            m.set_stage_prev([&stage_link](const int* tk, int T, int64_t pos0, bool spec, float* rows, std::string& e) {
+                return stage_link.rows(tk, T, pos0, spec, rows, e);
             });
             m.set_stage_sync([&stage_link](char op, int64_t arg) {
                 std::string e;
