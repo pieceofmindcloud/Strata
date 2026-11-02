@@ -393,6 +393,8 @@ struct Pack {
             }
         // the Engram tables
         std::FILE* e = std::fopen((d + "/engram.bin").c_str(), "rb");
+        // (a slice past every Engram layer: pack_gguf.py writes no tables for it)
+        if (e == nullptr && list("engram_layer_ids").empty()) return true;
         if (e == nullptr) {
             err = d + "/engram.bin: not found";
             return false;
