@@ -730,6 +730,10 @@ def main() -> int:
             if min(targets) < 0:
                 raise SystemExit("the DSpark drafter reads a layer before this slice: %r" % (targets,))
             kv["%s.dspark.target_layers" % arch] = targets
+            # the engine counts the drafter's blocks by the entries past the trunk's: a slice was cut to its own layers
+            ratios = list(kv.get("%s.attention.compress_ratios" % arch) or [])
+            if len(ratios) == int(kv["%s.block_count" % arch]):
+                kv["%s.attention.compress_ratios" % arch] = ratios + list(dg.kv["dflash.attention.compress_ratios"])
         if a.dspark_noise_token is not None:
             kv.setdefault("%s.dspark.noise_token_id" % arch, int(a.dspark_noise_token))
         if a.dspark_markov_rank is not None:
