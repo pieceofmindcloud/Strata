@@ -8511,6 +8511,28 @@ struct Model::Impl {
         };
         std::future<void> eg_next;
         if (!egs.empty()) eg_next = std::async(std::launch::async, read_eg, 0);
+        // A split's later stage, on the device of its first layer: the earlier stage's rows for every chunk of the run
+        // asked for ahead (the micro-pipeline, ds4_stage.hpp), so it reads chunk k + 1 while this one reads chunk k.
+        // One chunk has nothing to overlap and stays one round trip. Ended on every way out of the run (the answers
+        // already asked for are read, so the link stays in step for the state calls after it).
+        bool streaming = false;
+        if (stage_prev && stage_stream.begin && nk >= 2) {
+            bool first_here = false;
+            for (int m = 0; m < L[0].nm; ++m) first_here = first_here || member(L[0], m).dev == di;
+            if (first_here) {
+                std::vector<std::pair<int64_t, int>> pieces;
+                for (int k = 0; k < nk; ++k) pieces.emplace_back(run.p0[(size_t) k], run.T[(size_t) k]);
+                if (!stage_stream.begin(toks.data() + run.p0[0], pieces, err)) return false;
+                streaming = true;
+            }
+        }
+        struct StreamEnd {
+            Impl* p;
+            bool on;
+            ~StreamEnd() {
+                if (on) p->stage_stream.end();
+            }
+        } stream_end_{this, streaming};
         for (int k = 0; k < nk; ++k) {
             if (!chunk_go(k)) return halt_end(di, err);   // (a Stop: the chunks every device reaches are done)
             const int64_t p0 = run.p0[(size_t) k];
@@ -8541,7 +8563,9 @@ struct Model::Impl {
                     started = true;
                     if (il == 0 && stage_prev) {   // the earlier stage's rows for this chunk
                         std::vector<float> rows((size_t) T * stage_row_floats());
-                        if (!stage_prev(toks.data() + p0, T, p0, false, rows.data(), err)) return false;
+                        if (streaming ? !stage_stream.take(T, rows.data(), err)
+                                      : !stage_prev(toks.data() + p0, T, p0, false, rows.data(), err))
+                            return false;
                         const size_t nh = (size_t) T * H * D;
                         CK(cudaMemcpyAsync(c.h, rows.data(), nh * 4, cudaMemcpyHostToDevice, s));
                         CK(cudaMemcpyAsync(c.pre, rows.data() + nh, (size_t) T * 8 * 4, cudaMemcpyHostToDevice, s));
@@ -9448,6 +9472,7 @@ struct Model::Impl {
     // this stage hands on its own, instead of running the head; stage_sync mirrors a state call on the earlier stage.
     std::function<bool(const int*, int, int64_t, bool, float*, std::string&)> stage_prev;
     std::function<bool(char, int64_t)> stage_sync;
+    Model::StageStream stage_stream;   // a prompt's chunks asked for ahead (run_dev_chunks), when the link offers it
     bool stage_sync_muted = false;
     float* stage_out = nullptr;
     std::vector<float> stage_in;
@@ -10580,6 +10605,7 @@ void Model::set_stage_prev(std::function<bool(const int*, int, int64_t, bool, fl
     p_->stage_prev = std::move(rows);
 }
 void Model::set_stage_sync(std::function<bool(char, int64_t)> sync) { p_->stage_sync = std::move(sync); }
+void Model::set_stage_stream(StageStream stream) { p_->stage_stream = std::move(stream); }
 size_t Model::stage_row_floats() const { return p_->stage_row_floats(); }
 void Model::stage_rollback(int T, int keep) { p_->rollback(p_->pos - T, T, keep); }
 bool Model::stage_forward(const int* tokens, int T, float* rows, bool spec, std::string& err) {
