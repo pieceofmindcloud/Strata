@@ -1410,6 +1410,27 @@ int main(int argc, char** argv) {
                 if (!ok && op != 'B') std::fprintf(stderr, "maya-ds4: %s\n", e.c_str());
                 return ok;
             });
+            // the micro-pipeline: a prompt's chunks asked for ahead (STRATA_STAGE_INFLIGHT, STRATA_STAGE_INFLIGHT_MIB)
+            const size_t row = m.stage_row_floats();
+            std::fprintf(stderr, "maya-ds4: prompt chunks of up to 512 rows, up to %d asked for ahead\n",
+                         strata::ds4::stage::stream_depth(row, 512));
+            strata::ds4::Model::StageStream stream;
+            stream.begin = [&stage_link, row](const int* tk, const std::vector<std::pair<int64_t, int>>& chunks,
+                                              std::string& e) {
+                std::vector<strata::ds4::stage::Prev::Piece> pieces;
+                int widest = 1;
+                for (const auto& [pos0, T] : chunks) {
+                    pieces.push_back({pos0, T});
+                    widest = std::max(widest, T);
+                }
+                return stage_link.stream_begin(tk, std::move(pieces), strata::ds4::stage::stream_depth(row, widest), e);
+            };
+            stream.take = [&stage_link](int T, float* rows, std::string& e) { return stage_link.stream_take(T, rows, e); };
+            stream.end = [&stage_link] {
+                if (const int d = stage_link.stream_end(); d > 1)
+                    std::fprintf(stderr, "maya-ds4: a prompt read through the earlier stage, up to %d chunks in flight\n", d);
+            };
+            m.set_stage_stream(std::move(stream));
         }
         if (!m.stage_begin(!stage_serve.empty(), !stage_prev.empty(), err)) {
             std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());

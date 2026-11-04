@@ -18,6 +18,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::ds4 {
@@ -162,6 +163,15 @@ public:
     bool stage_begin(bool earlier, bool has_prev, std::string& err);
     void set_stage_prev(std::function<bool(const int*, int, int64_t, bool, float*, std::string&)> rows);
     void set_stage_sync(std::function<bool(char, int64_t)> sync);
+    /// A prompt's chunks asked for ahead (ds4_stage.hpp, Prev::stream_*): `begin` with the tokens from the first
+    /// chunk's position and each chunk's (pos0, T), `take` the next chunk's rows in order, `end` when the run ends
+    /// (any way it ends). Without it every chunk is one round trip, as set_stage_prev.
+    struct StageStream {
+        std::function<bool(const int*, const std::vector<std::pair<int64_t, int>>&, std::string&)> begin;
+        std::function<bool(int, float*, std::string&)> take;
+        std::function<void()> end;
+    };
+    void set_stage_stream(StageStream stream);
     size_t stage_row_floats() const;
     /// Runs this stage's layers on the next window and writes h | pre to `rows` (T * stage_row_floats()).
     /// `spec`: a draft's verification, which stage_rollback may take back in part.
