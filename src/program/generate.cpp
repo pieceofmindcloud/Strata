@@ -4122,6 +4122,21 @@ int main(int argc, char** argv) {
         // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
         // anything is allocated: an unsupported down type used to exit from inside the first verify window, and
         // an unsupported dequant type left the prompt path's fp16 buffer unwritten.
+        // A stage cut from the whole model (--stage-layers) holds the experts of its own layers only, as a slice stage
+        // does: the whole-model pack lists every layer, and the arena held all of them (40 of Flash-Next's 76 GB in RAM
+        // for a stage of half the layers).
+        if (o.stage_layers_lo >= 0 && stage_mode) {
+            const uint64_t before = strata::kernels::cpu::expert_layout().total;
+            std::string why;
+            if (strata::kernels::cpu::expert_layout_keep_layers(o.pack, o.stage_lo, o.stage_hi, why))
+                std::fprintf(stderr, "strata generate: stage of layers %lld-%lld: the experts of the other layers stay "
+                                     "out of RAM (%.2f of %.2f GiB)\n", (long long) o.stage_lo, (long long) (o.stage_hi - 1),
+                             (double) strata::kernels::cpu::expert_layout().total / 1073741824.0,
+                             (double) before / 1073741824.0);
+            else
+                std::fprintf(stderr, "strata generate: stage of layers %lld-%lld: every layer's experts load (%s)\n",
+                             (long long) o.stage_lo, (long long) (o.stage_hi - 1), why.c_str());
+        }
         const auto& lay = strata::kernels::cpu::expert_layout();
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
             if (stage_mode && (l < o.stage_lo || l >= o.stage_hi)) continue;   // another stage's layer

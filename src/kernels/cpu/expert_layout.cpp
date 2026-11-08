@@ -587,4 +587,25 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
 #endif
 }
 
+bool expert_layout_keep_layers(const std::string& pack_dir, int64_t lo, int64_t hi, std::string& err) {
+    ExpertLayout& L = g_layout;
+    if (!L.native || L.gguf_off.size() != (size_t) (3 * L.n_layers)) {
+        err = "not a native pack with GGUF offsets";
+        return false;
+    }
+    if (std::ifstream(pack_dir + "/experts.bin", std::ios::binary)) {
+        err = "the pack has an experts.bin, whose offsets the arena keeps";
+        return false;
+    }
+    uint64_t at = 0;
+    for (int64_t l = 0; l < L.n_layers; ++l) {
+        if (l < lo || l >= hi) L.bytes[(size_t) l] = 0;
+        L.offset[(size_t) l] = at;
+        at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
+    }
+    L.total = at;
+    L.stage_subset = true;
+    return true;
+}
+
 }  // namespace strata::kernels::cpu
