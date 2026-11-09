@@ -26,6 +26,9 @@
 #endif
 #include "ds4_launch.h"   // ds4_dbg
 #include "ds4_model.hpp"
+#if !defined(_WIN32)
+#include "ds4_stage.hpp"
+#endif
 #include "ds4_experts_rule.hpp"
 #include "ds4_os.hpp"
 #include "ds4_packinfo.hpp"
@@ -1276,6 +1279,7 @@ int main(int argc, char** argv) {
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
     unsigned long long cli_seed = 1;
     bool serve_mode = false;
+    std::string stage_serve, stage_prev;
     bool pack_info_mode = false;
     std::string images, enc_rgb, enc_out;
     std::string score_ids, score_out, prof_ids, spec_ids;
@@ -1350,6 +1354,8 @@ int main(int argc, char** argv) {
         else if (a == "--profile-run") prof_ids = val("--profile-run");
         else if (a == "--spec-eval") spec_ids = val("--spec-eval");
         else if (a == "--serve") serve_mode = true;
+        else if (a == "--stage-serve") stage_serve = val("--stage-serve");
+        else if (a == "--stage-prev") stage_prev = val("--stage-prev");
         else if (a == "--pack-info") pack_info_mode = true;
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
         else if (a == "--help" || a == "-h") {
@@ -1375,6 +1381,7 @@ int main(int argc, char** argv) {
     if (o.profile.empty()) o.profile = o.pack + "/expert-profile.bin";   // "none": no profile
     if (o.profile == "none") o.profile.clear();
     o.vision_only = !enc_rgb.empty();
+    o.stage_split = !stage_serve.empty() || !stage_prev.empty();
     strata::ds4::Model m;
     std::string err;
     if (!m.load(o, err)) {
@@ -1383,6 +1390,60 @@ int main(int argc, char** argv) {
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
     if (const char* idle = std::getenv("DS4_TEST_IDLE_MS")) std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(idle)));   // (tests: a person typing)
+#if !defined(_WIN32)
+    strata::ds4::stage::Prev stage_link;
+    if (!stage_serve.empty() || !stage_prev.empty()) {
+        const char* token = std::getenv("STRATA_STAGE_TOKEN");
+        const char* prev_token = std::getenv("STRATA_STAGE_PREV_TOKEN");
+        if (!stage_prev.empty()) {
+            const std::string secret = prev_token != nullptr ? prev_token : token != nullptr ? token : "";
+            if (!stage_link.connect(stage_prev, secret, m.stage_row_floats(), err)) {
+                std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
+                return 1;
+            }
+            m.set_stage_prev([&stage_link](const int* tk, int T, int64_t pos0, bool spec, float* rows, std::string& e) {
+                return stage_link.rows(tk, T, pos0, spec, rows, e);
+            });
+            m.set_stage_sync([&stage_link](char op, int64_t arg) {
+                std::string e;
+                const bool ok = stage_link.sync(op, arg, e);
+                if (!ok && op != 'B') std::fprintf(stderr, "maya-ds4: %s\n", e.c_str());
+                return ok;
+            });
+            // the micro-pipeline: a prompt's chunks asked for ahead (STRATA_STAGE_INFLIGHT, STRATA_STAGE_INFLIGHT_MIB)
+            const size_t row = m.stage_row_floats();
+            std::fprintf(stderr, "maya-ds4: prompt chunks of up to 512 rows, up to %d asked for ahead\n",
+                         strata::ds4::stage::stream_depth(row, 512));
+            strata::ds4::Model::StageStream stream;
+            stream.begin = [&stage_link, row](const int* tk, const std::vector<std::pair<int64_t, int>>& chunks,
+                                              std::string& e) {
+                std::vector<strata::ds4::stage::Prev::Piece> pieces;
+                int widest = 1;
+                for (const auto& [pos0, T] : chunks) {
+                    pieces.push_back({pos0, T});
+                    widest = std::max(widest, T);
+                }
+                return stage_link.stream_begin(tk, std::move(pieces), strata::ds4::stage::stream_depth(row, widest), e);
+            };
+            stream.take = [&stage_link](int T, float* rows, std::string& e) { return stage_link.stream_take(T, rows, e); };
+            stream.end = [&stage_link] {
+                if (const int d = stage_link.stream_end(); d > 1)
+                    std::fprintf(stderr, "maya-ds4: a prompt read through the earlier stage, up to %d chunks in flight\n", d);
+            };
+            m.set_stage_stream(std::move(stream));
+        }
+        if (!m.stage_begin(!stage_serve.empty(), !stage_prev.empty(), err)) {
+            std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
+            return 1;
+        }
+        if (!stage_serve.empty()) return strata::ds4::stage::serve(m, stage_serve, token != nullptr ? token : "");
+    }
+#else
+    if (!stage_serve.empty() || !stage_prev.empty()) {
+        std::fprintf(stderr, "maya-ds4: a split across processes is not built on this system\n");
+        return 1;
+    }
+#endif
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack);
     const int window_given = window;
     if (window == 0) window = 16;   // (the scoring / profiling runs; the plain run below takes the model's feed unit)

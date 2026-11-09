@@ -18,6 +18,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::ds4 {
@@ -57,6 +58,7 @@ struct Options {
     // heads, of the output projection and of every expert's FFN, summed through host-mapped memory (a GPU unlike the
     // next stays alone); tp > 1 runs with threads (--tp 1 --threads off: one host thread, layer split only)
     int tp = 2;
+    bool stage_split = false;         // a stage of a split across processes (ds4_stage.hpp): smaller prompt chunks
     bool threads = false;             // a host thread per GPU enqueues its layers (the hand-offs host-mapped)
     // prompts in chunks of this many tokens through each layer at once (threads): the GEMMs on the tensor cores, the
     // CPU lane's experts streamed to the GPUs a chunk at a time instead of computed on the host; 0: windows of 16;
@@ -157,6 +159,24 @@ public:
     const std::vector<int32_t>& tokens() const;   // what the state has consumed, in order
 
     void reset();
+    /// A split across processes (ds4_stage.hpp), called after load(). `earlier`: this stage hands on to a next one.
+    bool stage_begin(bool earlier, bool has_prev, std::string& err);
+    void set_stage_prev(std::function<bool(const int*, int, int64_t, bool, float*, std::string&)> rows);
+    void set_stage_sync(std::function<bool(char, int64_t)> sync);
+    /// A prompt's chunks asked for ahead (ds4_stage.hpp, Prev::stream_*): `begin` with the tokens from the first
+    /// chunk's position and each chunk's (pos0, T), `take` the next chunk's rows in order, `end` when the run ends
+    /// (any way it ends). Without it every chunk is one round trip, as set_stage_prev.
+    struct StageStream {
+        std::function<bool(const int*, const std::vector<std::pair<int64_t, int>>&, std::string&)> begin;
+        std::function<bool(int, float*, std::string&)> take;
+        std::function<void()> end;
+    };
+    void set_stage_stream(StageStream stream);
+    size_t stage_row_floats() const;
+    /// Runs this stage's layers on the next window and writes h | pre to `rows` (T * stage_row_floats()).
+    /// `spec`: a draft's verification, which stage_rollback may take back in part.
+    bool stage_forward(const int* tokens, int T, float* rows, bool spec, std::string& err);
+    void stage_rollback(int T, int keep);
     /// Keep the state at the current position in checkpoint slot 0 or 1 (the end of a prompt, the position before it);
     /// restore(limit) goes back to the latest one at or before limit (-1: none).
     void checkpoint(int slot = 0);
