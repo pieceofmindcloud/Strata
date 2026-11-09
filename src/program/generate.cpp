@@ -3939,6 +3939,13 @@ int main(int argc, char** argv) {
             o.mtp.clear();                                           // the drafter is on the last stage
             o.no_prefill_borrow = true;   // its prompt path keeps its own buffers: no loans to give back between reads
             o.spec = std::max(o.spec, strata::kernels::kVerifyMaxT);  // any window the last stage sends
+            // The `--prefill auto` rule above (nothing to lend from: small buffers) ran before this turned borrowing
+            // off, so the auto chunk stayed at its NVIDIA 32768: the cache sizing then priced the prompt path's own
+            // buffers at ~21.9 GiB, no slot was left on a 16 GB card and the verify window refused to start.
+            if (o.prefill_auto) {
+                o.prefill_auto = false;
+                o.prefill_chunk = 2048;
+            }
         }
         std::fprintf(stderr, "strata generate: stage of layers %lld-%lld (%s)\n", (long long) o.stage_lo,
                      (long long) o.stage_hi - 1,
