@@ -533,6 +533,12 @@ def main() -> int:
     if not shards or not all(p.is_file() for p in shards):
         raise SystemExit("%s: no .gguf files" % model if not shards else
                          "%s: not there" % next(p for p in shards if not p.is_file()))
+    # one writer per pack: a second engine asking for the same pack waits for the first, which wrote it
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import pack_lock  # noqa: E402
+    if pack_lock.acquire(out):
+        print("the pack was written by the other process: nothing to do")
+        return 0
     gs = [Gguf(p) for p in shards]
     if not a.shards:                       # a folder's *.gguf: the Engram table (architecture 'engram', today 'deepseek41-engram') is not a model shard
         keep = [i for i, g in enumerate(gs) if not is_engram_file(g)]
