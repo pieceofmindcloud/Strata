@@ -31,6 +31,9 @@ struct ExpertLayout {
     int version = 0;                      ///< native_experts.txt's header version (0 = none given)
     uint64_t max_blob = BLOB;
     uint64_t total = 0;                   ///< experts.bin size
+    /// The layers outside a stage cut from a whole-model pack were dropped (`expert_layout_keep_layers`): `offset`
+    /// and `total` then describe this process's arena only, no longer the pack's experts.bin.
+    bool stage_subset = false;
 
     uint64_t blob_bytes(int64_t layer) const { return native ? bytes[(size_t) layer] : (uint64_t) BLOB; }
     uint64_t layer_offset(int64_t layer) const {
@@ -94,6 +97,10 @@ const ExpertLayout& expert_layout();
 /// Reads `<pack_dir>/native_experts.txt` when it exists (a native pack), else sets the canonical layout.
 /// Versions up to kExpertLayoutVersion are read; a newer one is refused (a newer packer wrote it).
 bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
+/// A stage cut from a whole-model pack (--stage-layers): keep the experts of layers [lo, hi) only, as the pack of a
+/// layer slice would list them - the other layers get no bytes and the arena is packed over the kept ones.  Only for
+/// a native pack read from the GGUF (no experts.bin, whose file offsets the arena's must equal); false otherwise.
+bool expert_layout_keep_layers(const std::string& pack_dir, int64_t lo, int64_t hi, std::string& err);
 /// The newest native_experts.txt this engine reads.  v4 = v3 plus the per-role shard column `gate,up,down`,
 /// written only when some layer's roles are in different shards (every other pack stays v3, byte for byte).
 /// v5 = v4 plus `hadamard.txt` beside it: Hadamard-folded experts (hadamard.hpp), written only for such models,

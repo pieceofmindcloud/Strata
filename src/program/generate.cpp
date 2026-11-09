@@ -803,6 +803,10 @@ struct Options {
     // as --stage-serve HOST:PORT (it answers the next stage's process with its rows); a later stage serves the
     // requests and asks the earlier stage for its rows over --stage-prev HOST:PORT (STRATA_STAGE_TOKEN).
     int64_t stage_lo = 0, stage_hi = -1;
+    /// --stage-layers LO-HI: the same stage cut from a WHOLE model (--native names the whole model's first shard,
+    /// --pack its whole-model pack) instead of from a slice file: this process runs layers LO..HI inclusive and
+    /// reads nothing of the others.  -1: not given.
+    int64_t stage_layers_lo = -1, stage_layers_hi = -1;
     bool stage_serve = false;
     std::string stage_listen;
     std::string stage_prev;
@@ -3192,6 +3196,20 @@ int main(int argc, char** argv) {
         else if (a == "--serve") o.serve = true;
         else if (a == "--stage-serve") { o.stage_listen = next("--stage-serve"); o.stage_serve = true; }
         else if (a == "--stage-prev") o.stage_prev = next("--stage-prev");
+        else if (a == "--stage-layers") {
+            const std::string v = next("--stage-layers");
+            const size_t dash = v.find('-');
+            char* e1 = nullptr;
+            char* e2 = nullptr;
+            const long long lo = dash == std::string::npos ? -1 : std::strtoll(v.c_str(), &e1, 10);
+            const long long hi = dash == std::string::npos ? -1 : std::strtoll(v.c_str() + dash + 1, &e2, 10);
+            if (dash == std::string::npos || e1 != v.c_str() + dash || e2 == nullptr || *e2 != '\0' || lo < 0 || hi < lo) {
+                std::fprintf(stderr, "strata generate: --stage-layers takes LO-HI (inclusive, LO <= HI), not '%s'\n", v.c_str());
+                return 2;
+            }
+            o.stage_layers_lo = lo;
+            o.stage_layers_hi = hi;
+        }
         else if (a == "--vision") o.vision = true;
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
@@ -3802,16 +3820,25 @@ int main(int argc, char** argv) {
                     return 2;
                 }
             }
-            {   // a layer slice: this process is one stage of the model
+            {   // a layer slice, or --stage-layers on the whole model: this process is one stage of the model
                 const strata::GgufFile first(o.native_shards[0]);
                 if (first.slice_begin() >= 0) {
+                    if (o.stage_layers_lo >= 0) {
+                        std::fprintf(stderr, "strata generate: --stage-layers cuts a stage from a whole model; %s is "
+                                             "already a layer slice\n", o.native_preset.c_str());
+                        return 2;
+                    }
                     o.stage_lo = first.slice_begin();
                     o.stage_hi = first.slice_end() + 1;
+                } else if (o.stage_layers_lo >= 0) {
+                    o.stage_lo = o.stage_layers_lo;
+                    o.stage_hi = o.stage_layers_hi + 1;
                 }
             }
             // --ple-gguf defaults to the shard that holds the PLE table, found by name: shard 2 of the ISTA files
-            // and of Unsloth's UD-Q4_K_XL, shard 1 of Swift's
-            if (o.ple_gguf.empty() && !o.no_ple) {
+            // and of Unsloth's UD-Q4_K_XL, shard 1 of Swift's.  A stage past layer 1 never runs the PLE block, so a
+            // stage cut from the whole model does not go looking for the table (a slice past layer 1 has none).
+            if (o.ple_gguf.empty() && !o.no_ple && o.stage_lo <= 1) {
                 const strata::GgufModel model(o.native_shards);
                 size_t at = 0;
                 if (model.find("per_layer_token_embd.weight", &at) != nullptr) o.ple_gguf = o.native_shards[at];
@@ -3875,8 +3902,13 @@ int main(int argc, char** argv) {
     strata::stage::PrevStage stage_prev;   // a later stage's link to the earlier stage's process
 #endif
     const int64_t kStageLayers = 48;   // the qwen4exp geometry (Qwen4ExpGuard)
+    if (o.stage_layers_lo >= 0 && o.native_preset.empty()) {
+        std::fprintf(stderr, "strata generate: --stage-layers needs --native naming the whole model\n");
+        return 2;
+    }
     if (stage_mode || o.stage_serve || !o.stage_prev.empty()) {
-        const char* why = !stage_mode ? "--stage-serve and --stage-prev need --native with a layer slice"
+        const char* why = !stage_mode ? "--stage-serve and --stage-prev need --native with a layer slice, or --stage-layers"
+                        : o.stage_hi > kStageLayers ? "--stage-layers goes past the model's last layer (47)"
                         : !split_auto && [&] {
                               for (const int64_t k : split_at)
                                   if (k <= o.stage_lo || k >= std::min<int64_t>(o.stage_hi, kStageLayers)) return true;
@@ -4090,6 +4122,21 @@ int main(int argc, char** argv) {
         // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
         // anything is allocated: an unsupported down type used to exit from inside the first verify window, and
         // an unsupported dequant type left the prompt path's fp16 buffer unwritten.
+        // A stage cut from the whole model (--stage-layers) holds the experts of its own layers only, as a slice stage
+        // does: the whole-model pack lists every layer, and the arena held all of them (40 of Flash-Next's 76 GB in RAM
+        // for a stage of half the layers).
+        if (o.stage_layers_lo >= 0 && stage_mode) {
+            const uint64_t before = strata::kernels::cpu::expert_layout().total;
+            std::string why;
+            if (strata::kernels::cpu::expert_layout_keep_layers(o.pack, o.stage_lo, o.stage_hi, why))
+                std::fprintf(stderr, "strata generate: stage of layers %lld-%lld: the experts of the other layers stay "
+                                     "out of RAM (%.2f of %.2f GiB)\n", (long long) o.stage_lo, (long long) (o.stage_hi - 1),
+                             (double) strata::kernels::cpu::expert_layout().total / 1073741824.0,
+                             (double) before / 1073741824.0);
+            else
+                std::fprintf(stderr, "strata generate: stage of layers %lld-%lld: every layer's experts load (%s)\n",
+                             (long long) o.stage_lo, (long long) (o.stage_hi - 1), why.c_str());
+        }
         const auto& lay = strata::kernels::cpu::expert_layout();
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
             if (stage_mode && (l < o.stage_lo || l >= o.stage_hi)) continue;   // another stage's layer
@@ -4469,6 +4516,28 @@ int main(int argc, char** argv) {
     // Without this each card keeps a full copy (~3.4 GB for the Coder) that its stage never reads - VRAM the
     // expert cache wants.  Opt-in, STRATA_STAGE_TRIM=1, on HIP and CUDA alike: measured on 2x MI50 (PR #639),
     // and the default waits for its author's re-run of the release branch on his cards.
+    // A STAGE CUT FROM THE WHOLE MODEL (--stage-layers): leave out what the slice file of the same layers would not
+    // hold - every other layer's tensors, the output head before the last stage and the PLE table past layer 1 - so
+    // the stage loads what a slice stage loads.  The whole-model pack holds them all.
+    if (o.stage_layers_lo >= 0 && stage_mode) {
+        std::FILE* f = std::fopen((o.pack + "/index.txt").c_str(), "rb");
+        if (f) {
+            char line[1024], name[256];
+            while (std::fgets(line, sizeof line, f)) {
+                if (line[0] == '#' || std::sscanf(line, "%255s", name) != 1) continue;
+                const std::string n = name;
+                if (n.rfind("blk.", 0) == 0) {
+                    const int64_t l = std::atoll(name + 4);
+                    if (l < o.stage_lo || l >= o.stage_hi) skip.insert(n);
+                } else if ((n == "output.weight" && o.stage_hi < g.n_layers) ||
+                           (n == "per_layer_token_embd.weight" && o.stage_lo > 1)) {
+                    skip.insert(n);
+                }
+            }
+            std::fclose(f);
+        }
+        if (o.stage_hi < g.n_layers) skip.insert("output.weight");
+    }
     const std::set<std::string> skip_base = skip;
     // --trim-stage-weights (PR #559) is the same switch as STRATA_STAGE_TRIM=1 (PR #639)
     const bool trim_asked = o.trim_stage_weights || [] {

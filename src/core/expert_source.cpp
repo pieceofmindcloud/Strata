@@ -5735,6 +5735,13 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     }
     const int64_t blob = (int64_t) lay.max_blob;
     const uint64_t want = lay.total;
+    // a stage's subset of a whole-model pack (expert_layout_keep_layers): its arena is not the pack's, so it is
+    // neither written as the pack's experts.bin (STRATA_ARENA_MMAP) nor shared with the other engines of that pack
+    if (lay.stage_subset && !shared_arena_file.empty()) {
+        err = "ArenaExpertSource: --shared-expert-arena shares a whole pack's arena; a stage cut from it (--stage-layers) "
+              "holds only its own layers";
+        return false;
+    }
 
     // plan v0.3 P6: no experts.bin in a native pack -> the experts come straight from the GGUF
     const bool from_gguf = !std::ifstream(path, std::ios::binary) && lay.native && !lay.gguf_off.empty() && !gguf_.empty();
@@ -5976,14 +5983,14 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // the first start: write experts.bin for the mapped starts after this one - only when the drive has room for it
     // and 2 GiB more (a full drive fails other writes too); otherwise this start says so and runs pinned as before
     std::error_code space_ec;
-    const uint64_t free_disk = arena_mmap && from_gguf ? (uint64_t) std::filesystem::space(
+    const uint64_t free_disk = arena_mmap && from_gguf && !lay.stage_subset ? (uint64_t) std::filesystem::space(
         std::filesystem::path(path).parent_path(), space_ec).available : 0;
     const bool room = !space_ec && free_disk >= want + (uint64_t) blob + (2ull << 30);
-    if (arena_mmap && from_gguf && !room)
+    if (arena_mmap && from_gguf && !lay.stage_subset && !room)
         std::fprintf(stderr, "strata generate: STRATA_ARENA_MMAP: NOT writing %s - %.1f GiB free on that drive, it needs "
                              "%.1f GiB plus 2 GiB to spare; this start keeps the arena in RAM\n", path.c_str(),
                      (double) free_disk / 1073741824.0, (double) (want + (uint64_t) blob) / 1073741824.0);
-    if (arena_mmap && from_gguf && room) {
+    if (arena_mmap && from_gguf && !lay.stage_subset && room) {
         const std::string tmp = path + ".tmp";
         std::FILE* f = std::fopen(tmp.c_str(), "wb");
         bool ok = f != nullptr && std::fwrite(a->data(), 1, (size_t) want, f) == (size_t) want;
