@@ -393,6 +393,58 @@ def engram_set(model: pathlib.Path, explicit: str | None):
     return None, []
 
 
+def cut_layers(kv: dict, tensors: list, lo: int, hi: int):
+    """--layers LO-HI: the pack of layers LO..HI of the whole model, as a slice's pack would be - the blocks renumbered
+    from 0, the per-layer metadata cut to the range and rebased, the cross-layer sources rebased (the candidate source
+    dropped when it falls outside, which is what the engine reads as no candidate selection), and the Engram hash
+    parameters cut to the Engram layers the range holds (each layer has its own multipliers, primes and offsets).
+    pom.start_layer / end_layer / original_block_count say it is a slice, so the drafter's target layers are rebased
+    and the drafter is refused on a range that is not the last.  The embedding, the norms and the head stay: every
+    slice of this architecture carries them."""
+    a = kv["general.architecture"]
+    key = lambda k: "%s.%s" % (a, k)  # noqa: E731
+    total = int(kv[key("block_count")])
+    if not 0 <= lo <= hi < total:
+        raise SystemExit("--layers %d-%d: the model has layers 0-%d" % (lo, hi, total - 1))
+    kept = []
+    for t in tensors:
+        m = re.match(r"layers\.(\d+)\.(.+)$", t[0])
+        if m is None:
+            kept.append(t)
+        elif lo <= int(m.group(1)) <= hi:
+            kept.append(("layers.%d.%s" % (int(m.group(1)) - lo, m.group(2)),) + tuple(t[1:]))
+    tensors[:] = kept
+    kv[key("block_count")] = hi - lo + 1
+    for k in ("attention.compress_ratios", "swiglu_clamp_exp", "swiglu_clamp_shexp"):
+        v = kv.get(key(k))
+        if isinstance(v, list) and len(v) >= total:
+            kv[key(k)] = v[lo:hi + 1]
+    for k in ("attention.kv_source_layers", "attention.indexer.source_layers"):
+        if key(k) in kv:
+            kv[key(k)] = [int(x) - lo for x in kv[key(k)] if lo <= int(x) <= hi]
+    cand = key("attention.indexer.candidate_source_layer")
+    if cand in kv:
+        if lo <= int(kv[cand]) <= hi:
+            kv[cand] = int(kv[cand]) - lo
+        else:
+            del kv[cand]
+    layers = [int(x) for x in kv.get(key("engram.layers"), [])]
+    if layers:
+        ngram, heads = int(kv[key("engram.max_ngram_size")]), int(kv[key("engram.head_count")])
+        cols = (ngram - 1) * heads
+        pick = [i for i, il in enumerate(layers) if lo <= il <= hi]
+        cut = lambda v, w: [x for i in pick for x in v[i * w:(i + 1) * w]]  # noqa: E731
+        kv[key("engram.multipliers")] = cut(list(kv[key("engram.multipliers")]), ngram)
+        kv[key("engram.primes")] = cut(list(kv[key("engram.primes")]), cols)
+        kv[key("engram.offsets")] = cut(list(kv[key("engram.offsets")]), cols)
+        if key("engram.num_embeddings") in kv:
+            kv[key("engram.num_embeddings")] = cut(list(kv[key("engram.num_embeddings")]), 1)
+        kv[key("engram.layers")] = [layers[i] - lo for i in pick]
+    if key("ple.layers") in kv:
+        kv[key("ple.layers")] = [int(x) - lo for x in kv[key("ple.layers")] if lo <= int(x) <= hi]
+    kv["pom.start_layer"], kv["pom.end_layer"], kv["pom.original_block_count"] = lo, hi, total
+
+
 def write_engram(out: pathlib.Path, kv: dict, vocab: int):
     a = kv["general.architecture"]
     g = lambda k, d=None: kv.get("%s.%s" % (a, k), d)  # noqa: E731
@@ -470,6 +522,8 @@ def main() -> int:
                                           "engram.*: layers, head offsets, vocab sizes, multipliers, token map), for a quant whose own "
                                           "shards leave them out (the IST-DAS sets name the Engram only in deepseek41.engram_* keys and "
                                           "carry no token map); the tables themselves still come from --engram")
+    ap.add_argument("--layers", help="LO-HI: pack only these layers of the whole model, renumbered from 0 like a slice "
+                    "(a stage of a split across processes); the drafter only on the range with the last layer")
     ap.add_argument("--shards", nargs="+", help="the GGUF's files in --model (default: every .gguf there - one "
                                                 "model's; the setup names them: a folder may hold an earlier layout)")
     a = ap.parse_args()
@@ -702,6 +756,10 @@ def main() -> int:
             n_here += 1
         n_dense += n_here + n_add
         print("dense override from %s: %d tensors replaced, %d added (a later folder wins)" % (dd, n_here, n_add))
+    if a.layers:
+        lo, _, hi = a.layers.partition("-")
+        cut_layers(kv, tensors, int(lo), int(hi or lo))
+        print("layers %s of %d: %d tensors" % (a.layers, int(kv["pom.original_block_count"]), len(tensors)))
     # the DSpark drafter from unsloth's GGUF (architecture dflash): blk.N.* -> mtp.N.*, the head tensors under the
     # checkpoint's names (fc -> main_proj, enc.output_norm -> main_norm, output_norm -> norm of the last block,
     # conf_proj -> confidence_head.proj, markov_w1 / w2 -> markov_head.embed / head)
