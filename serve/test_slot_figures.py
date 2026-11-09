@@ -25,7 +25,7 @@ class SlotFigures(unittest.TestCase):
         finish, tokens = e._await_bdone(0, [1, 2, 3])
         self.assertEqual(finish, "cancel")
         self.assertEqual(tokens, [1, 2, 3, 11, 12])
-        self.assertEqual(e.last["decode_ms"], 6380.5)
+        self.assertEqual(e.last["decode_ms"], 6407.5)  # upstream totals admission (27) and slot (6380.5)
         self.assertEqual(e.last["generated"], 300)
         self.assertEqual(e.last["prompt_ms"], 3431.0)
 

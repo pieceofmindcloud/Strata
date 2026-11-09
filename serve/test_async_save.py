@@ -114,6 +114,9 @@ class AsyncSave(unittest.TestCase):
         e.save_q = queue.Queue()
         e.lines = queue.Queue()
         e.slot_q = []
+        e.slot_busy = []
+        e.rid_q = {}
+        e.multi = 0
         e.ended = False
         e.proc = types.SimpleNamespace(stdout=iter([
             "SAVING 5 1.0\n", "SAVED 5 10 2.0\n", "SERR storage 0 full\n", "RESTORED 5 10 1.0\n",
