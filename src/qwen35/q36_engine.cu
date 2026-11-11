@@ -16,6 +16,12 @@
 //
 // Modes: --serve (serve/server.py's engine protocol: READY / GEN / T / DONE / STOP / PP), --tokens IDS [--n N]
 // [--force IDS] [--dump-full-logits F] (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
+//
+// A STAGE OF A SPLIT (--stage-layers LO-HI, cut from the whole file): `layers` holds only those layers.  The first
+// stage runs --stage-serve HOST:PORT (src/program/stage_link.hpp's protocol: H Z R S P Q, the residual rows after
+// its last layer in each 'P' answer); the last runs --serve (or --tokens) with --stage-prev HOST:PORT and reads every
+// chunk's and every decoded token's rows from it before its own layers.  One session, no MTP drafts, no pictures,
+// no middle stage yet; 'R' continues only the earlier stage's live session (else both read from position 0).
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/kernels/fused_gdn.hpp"
@@ -28,6 +34,7 @@
 #include "strata/qwen35/engine.hpp"
 #include "strata/qwen35/sampling.hpp"
 #include "q36_kernels.cuh"
+#include "../program/stage_link.hpp"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -873,6 +880,12 @@ struct Model {
     int64_t top_k = 8;
     float eps = 1e-6f, rope_base = 1e7f;
     int n_rot = 64;
+    /// THE STAGE: the layers [stage_lo, stage_hi) of the whole model (all of them unless --stage-layers). `layers`
+    /// holds those only, in order: local index i is the model's layer stage_lo + i.  The first stage reads the token
+    /// embedding, the last one holds the output norm and head; a stage between them hands on the residual rows.
+    int64_t stage_lo = 0, stage_hi = 0;
+    bool first_stage() const { return stage_lo == 0; }
+    bool last_stage() const { return stage_hi == g.n_layers; }
     std::vector<Layer> layers;
     const float* out_norm = nullptr;
     Mat head;
@@ -957,7 +970,7 @@ float* upload_f32(const strata::TensorInfo& t, const uint8_t* src) {
     return d;
 }
 
-bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
+bool load(const std::string& path, Model& m, std::string& err, bool want_mtp, int64_t lo = 0, int64_t hi = -1) {
     const auto t0 = Clock::now();
     m.file = std::make_shared<strata::GgufModel>(strata::GgufModel::open(path));
     const strata::GgufModel& gm = *m.file;
@@ -1024,14 +1037,24 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         return w;
     };
     auto L = [](int64_t l, const char* s) { return "blk." + std::to_string(l) + "." + s; };
-    m.layers.resize((size_t) g.n_layers);
+    if (hi < 0) hi = g.n_layers;
+    if (lo < 0 || lo >= hi || hi > g.n_layers) {
+        err = "--stage-layers " + std::to_string(lo) + "-" + std::to_string(hi - 1) + " is outside the model's layers 0-" +
+              std::to_string(g.n_layers - 1);
+        return false;
+    }
+    m.stage_lo = lo;
+    m.stage_hi = hi;
+    const bool whole = m.first_stage() && m.last_stage();
+    m.layers.resize((size_t) (hi - lo));
     // the MTP block whenever the file has one, with or without drafts (--mtp): the VRAM it takes is then the same
-    // either way, so the hybrid mode's slot tables - and with them the greedy text - do not depend on --mtp
+    // either way, so the hybrid mode's slot tables - and with them the greedy text - do not depend on --mtp.  A stage
+    // of a split runs without it (the drafts would need the whole model's hidden state on the last stage).
     (void) want_mtp;
-    m.has_mtp = g.n_mtp_layers > 0;
-    for (int64_t l = 0; l < g.n_layers + (m.has_mtp ? 1 : 0); ++l) {
+    m.has_mtp = g.n_mtp_layers > 0 && whole;
+    for (int64_t l = lo; l < hi + (m.has_mtp ? 1 : 0); ++l) {
         const bool is_mtp = l == g.n_layers;
-        Layer& y = is_mtp ? m.mtp : m.layers[(size_t) l];
+        Layer& y = is_mtp ? m.mtp : m.layers[(size_t) (l - lo)];
         y.attn = is_mtp || strata::core::is_qsa_layer(g, l);
         y.attn_norm = f32(L(l, "attn_norm.weight"));
         y.post_norm = f32(L(l, "post_attention_norm.weight"));
@@ -1095,9 +1118,11 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         m.mtp_hnorm = f32(L(l, "nextn.hnorm.weight"));
         m.mtp_shnorm = f32(L(l, "nextn.shared_head_norm.weight"));
     }
-    m.out_norm = f32("output_norm.weight");
-    m.head = mat("output.weight");
-    {
+    if (m.last_stage()) {
+        m.out_norm = f32("output_norm.weight");
+        m.head = mat("output.weight");
+    }
+    if (m.first_stage()) {
         size_t s = 0;
         const strata::TensorInfo* t = find("token_embd.weight", s);
         m.embd_type = (int) t->type;
@@ -1112,6 +1137,10 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
     std::fprintf(stderr, "strata-q36: %s: %zu tensors (layout checked), %.2f GiB on the GPU in %.1f s (the routed "
                  "experts are placed after the engine's buffers)\n", path.c_str(), checked, (double) bytes / (1 << 30),
                  ms_since(t0) / 1000.0);
+    if (!whole)
+        std::fprintf(stderr, "strata-q36: a stage of the model: layers %lld-%lld of %lld%s%s\n", (long long) lo,
+                     (long long) hi - 1, (long long) g.n_layers, m.first_stage() ? ", the token embedding" : "",
+                     m.last_stage() ? ", the output head" : "");
     return true;
 }
 
@@ -2087,15 +2116,20 @@ struct Engine {
                 if (lhy(l)) seq.push_back((int) l);
             stream_begin(seq);
         }
-        K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok, T, N, x, st);
-        if (map_on) k_put_rows<<<T, kThreads, 0, st>>>(x, d_img, d_map, N);   // a picture's cells take its rows
+        // a later stage: the earlier stage's residual rows are in x already (rows_source)
+        if (m->first_stage()) {
+            K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok, T, N, x, st);
+            if (map_on) k_put_rows<<<T, kThreads, 0, st>>>(x, d_img, d_map, N);   // a picture's cells take its rows
+        }
         k_rms<<<T, kThreads, 0, st>>>(x, m->layers[0].attn_norm, h, N, m->eps);   // later layers: from k_moe_out
+        // a stage before the last: its last layer's next norm is a stand-in (the residual x is what goes on)
+        const float* end_norm = m->last_stage() ? m->out_norm : m->layers[0].attn_norm;
         for (size_t l = 0; l < m->layers.size(); ++l) {
             const bool last = l + 1 == m->layers.size();
-            layer(m->layers[l], l, T, p0, pos0, graph_mode, verify, last ? m->out_norm : m->layers[l + 1].attn_norm,
+            layer(m->layers[l], l, T, p0, pos0, graph_mode, verify, last ? end_norm : m->layers[l + 1].attn_norm,
                   last ? hmain : h);
         }
-        if (heads > 0) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
+        if (heads > 0 && m->last_stage()) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
     }
     /// logits [n][V] = W_out hn rows, and each row's greedy pick.
     void head_rows(const float* hn, int n, float* lg, int32_t* pk) {
@@ -2431,8 +2465,33 @@ struct Engine {
     /// token's logits stay in `logits` (its greedy pick in `pick`), hlast its normed hidden.  With the MTP block the
     /// prompt also runs through it (its K / V for every position: row q reads h_{q-1} and token q).  on_chunk(done) runs
     /// after every chunk; false ends the read there (a cancelled request): the tokens processed are returned.
+    /// A LATER STAGE: the earlier stage's residual rows for T tokens at positions p0 .. (`rows` gets T * n_embd
+    /// floats); false with `err` when the link failed.  Set on a stage that is not the first.
+    std::function<bool(const int32_t* toks, int T, int64_t p0, float* rows, std::string& err)> rows_source;
+    /// A later stage, at the start of a request: the earlier stage continues after `ids` (false: it holds no such
+    /// state, the request reads from position 0), or starts over.
+    std::function<bool(const std::vector<int32_t>& ids, std::string& err)> stage_resume;
+    std::function<bool(std::string& err)> stage_reset;
+    bool stage_failed = false;   ///< the last process() stopped because the earlier stage did not answer
+    std::string stage_err;
+    std::vector<float> stage_rows;
+    /// The rows of T tokens at `pos` into x, from the earlier stage (before forward, which then skips the embedding).
+    bool fetch_rows(const int32_t* toks, int T) {
+        const int N = (int) m->g.n_embd;
+        stage_rows.resize((size_t) T * N);
+        stage_err.clear();
+        if (!rows_source(toks, T, pos, stage_rows.data(), stage_err)) {
+            stage_failed = true;
+            if (stage_err.empty()) stage_err = "the earlier stage did not answer";
+            return false;
+        }
+        CK(cudaMemcpyAsync(x, stage_rows.data(), stage_rows.size() * 4, cudaMemcpyHostToDevice, st));
+        return true;
+    }
+
     template <class F> int64_t process(const int32_t* toks, int64_t n, F on_chunk_) {
         const int N = (int) m->g.n_embd;
+        stage_failed = false;
         auto on_chunk = [&](int64_t done) -> bool {   // a callback returning void never cancels
             if constexpr (std::is_void_v<decltype(on_chunk_(done))>) {
                 on_chunk_(done);
@@ -2447,10 +2506,12 @@ struct Engine {
             hpin[1] = (int32_t) pos;
             CK(cudaMemcpyAsync(tok, hpin, 4, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
+            if (rows_source && !fetch_rows(toks, 1)) return 0;
             chunk_pictures(pos, 1);
             rows_deferred = true;
-            // a prompt cell of a picture request (its rotary position is in the table, its row a picture's) runs eagerly
-            if (mtab_now || map_on) forward(1, pos, 1, false, false);
+            // a prompt cell of a picture request (its rotary position is in the table, its row a picture's) runs eagerly;
+            // so does a later stage's (its rows come from the link, not from a captured embedding)
+            if (mtab_now || map_on || rows_source) forward(1, pos, 1, false, false);
             else graph_run(gs().g1, [&] { forward(1, pos, 1, use_graph, false); });
             mtab_now = nullptr;
             map_on = false;
@@ -2467,6 +2528,7 @@ struct Engine {
             hpin[1] = (int32_t) pos;
             CK(cudaMemcpyAsync(tok, toks + i, (size_t) T * 4, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
+            if (rows_source && !fetch_rows(toks + i, T)) return i;
             chunk_pictures(pos, T);
             forward(T, pos, i + T == n ? 1 : 0, false, false);
             if (m->has_mtp && mtp_d > 0) {
@@ -3523,6 +3585,24 @@ struct Serve {
                 reuse = best;
             }
         }
+        // a later stage: the earlier stage must hold exactly the reused tokens, or both read from position 0
+        if (E.stage_reset) {
+            std::string e;
+            if (reuse > 0) {
+                const std::vector<int32_t> held(ids.begin(), ids.begin() + (long) reuse);
+                if (!E.stage_resume(held, e)) {
+                    std::fprintf(stderr, "strata-q36 stage: the earlier stage cannot continue after %zu tokens (%s): the "
+                                         "prompt reads from position 0\n", reuse, e.c_str());
+                    reuse = 0;
+                }
+            }
+            if (reuse == 0 && !E.stage_reset(e)) {
+                ss.live.clear();
+                std::printf("ERR the earlier stage: %s\n", e.c_str());
+                std::fflush(stdout);
+                return;
+            }
+        }
         E.select(s);
         if (reuse == 0) {
             E.reset();
@@ -3548,6 +3628,13 @@ struct Serve {
             if (stop.load() && done < fresh) { cancelled = true; return false; }
             return true;
         });
+        if (E.stage_failed) {   // the link to the earlier stage broke mid-prompt: nothing of this state is trusted
+            ss.live.clear();
+            E.reset();
+            std::printf("ERR the earlier stage: %s\n", E.stage_err.c_str());
+            std::fflush(stdout);
+            return;
+        }
         ss.live.insert(ss.live.end(), ids.begin() + (long) reuse, ids.begin() + (long) reuse + (long) got);
         ss.imgs.clear();
         bool cut = false;
@@ -3653,6 +3740,12 @@ struct Serve {
             if (E.pos + 1 > E.ctx) break;
             const int32_t one = nx;
             E.process(&one, 1, [](int64_t) {});
+            if (E.stage_failed) {   // the earlier stage stopped answering: the answer ends, the state starts over next time
+                std::fprintf(stderr, "strata-q36 stage: %s\n", E.stage_err.c_str());
+                ss.live.clear();
+                finish = "cancel";
+                break;
+            }
             ss.live.push_back(nx);
             fix.clear();
             if (!smp.needs_logits()) nx = E.greedy();
@@ -3723,6 +3816,127 @@ int serve(Engine& E) {
     return sv.run();
 }
 
+#if !defined(_WIN32)
+/// AN EARLIER STAGE (--stage-serve HOST:PORT with --stage-layers LO-HI): no requests of its own; the later stage's
+/// 'P' pieces are read through this stage's layers and its residual rows go back (stage_link.hpp's protocol, one
+/// session, no verify windows: this family's stages run without MTP drafts).  'R' continues only the live session.
+int stage_serve(Engine& E, const std::string& listen, const std::string& token) {
+    namespace sl = strata::stage;
+    const int N = (int) E.m->g.n_embd;
+    std::string err;
+    int bound = 0;
+    const int lfd = sl::tcp_open(listen, true, err, &bound);
+    if (lfd < 0) {
+        std::fprintf(stderr, "strata-q36 stage: %s\n", err.c_str());
+        return 1;
+    }
+    std::fprintf(stderr, "strata-q36 stage: layers %lld-%lld listening on %s (port %d), prompt chunk %d\n",
+                 (long long) E.m->stage_lo, (long long) E.m->stage_hi - 1, listen.c_str(), bound, E.tmax);
+    std::printf("READY stage\n");
+    std::fflush(stdout);
+    std::vector<int32_t> held;   // the tokens the live session holds
+    std::vector<char> req, ans;
+    for (;;) {
+        const int cfd = ::accept(lfd, nullptr, nullptr);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            std::fprintf(stderr, "strata-q36 stage: accept: %s\n", std::strerror(errno));
+            return 1;
+        }
+        const int one = 1;
+        ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        bool hello = false, quit = false;
+        while (!quit && sl::recv_msg(cfd, req)) {
+            size_t at = 1;
+            const char op = req.empty() ? 0 : req[0];
+            ans.assign(1, (char) 0);
+            size_t tensor_from = 0;
+            auto fail = [&](const std::string& e) {
+                ans.assign(1, (char) 1);
+                sl::put_bytes(ans, e.data(), e.size());
+            };
+            if (!hello && op != 'H') {
+                fail("say hello first");
+            } else if (op == 'H') {
+                if (std::string(req.data() + 1, req.size() - 1) != token) {
+                    fail("the stage token does not match");
+                    sl::send_msg(cfd, ans);
+                    break;
+                }
+                hello = true;
+                sl::put<uint32_t>(ans, (uint32_t) E.m->stage_lo);
+                sl::put<uint32_t>(ans, (uint32_t) E.m->stage_hi);
+                sl::put<uint32_t>(ans, (uint32_t) N);   // window rows (no windows are run, the width is the same)
+                sl::put<uint32_t>(ans, (uint32_t) N);   // prompt rows: the residual after the stage's last layer
+                sl::put<uint32_t>(ans, 0u);             // features: no 'V'
+            } else if (op == 'Z') {
+                E.reset();
+                held.clear();
+                std::fprintf(stderr, "strata-q36 stage: a request from position 0\n");
+            } else if (op == 'R') {
+                uint32_t n = 0;
+                std::vector<int32_t> ids;
+                bool ok = sl::get(req, at, n) && req.size() >= at + (size_t) n * 4;
+                if (ok) {
+                    ids.resize(n);
+                    std::memcpy(ids.data(), req.data() + at, (size_t) n * 4);
+                }
+                if (!ok) fail("a malformed resume");
+                else if (ids == held) sl::put<uint8_t>(ans, 1);
+                else fail("no state of this stage ends after those " + std::to_string(n) + " tokens");
+            } else if (op == 'S') {
+                // checkpoints are not kept: a later 'R' of them fails and the request reads from position 0
+            } else if (op == 'P') {
+                int64_t pos0 = 0;
+                uint32_t n = 0;
+                if (!sl::get(req, at, pos0) || !sl::get(req, at, n) || n == 0 || req.size() < at + (size_t) n * 8 + 1) {
+                    fail("a malformed prompt piece");
+                } else if (pos0 != E.pos || pos0 + (int64_t) n > E.ctx) {
+                    fail("a prompt piece at position " + std::to_string(pos0) + ", but this stage is at " +
+                         std::to_string(E.pos));
+                } else {
+                    std::vector<int32_t> toks(n);
+                    for (uint32_t i = 0; i < n; ++i) {
+                        int64_t t = 0;
+                        std::memcpy(&t, req.data() + at + (size_t) i * 8, 8);
+                        toks[i] = (int32_t) t;
+                    }
+                    bool bad = false;
+                    for (int32_t t : toks) bad |= t < 0 || t >= (int32_t) E.m->g.n_vocab;
+                    if (bad) {
+                        fail("a token id is outside the vocabulary");
+                    } else {
+                        ans.resize(1 + (size_t) n * N * 4);
+                        int64_t prev = 0;
+                        E.process(toks.data(), (int64_t) n, [&](int64_t done) {
+                            CK(cudaStreamSynchronize(E.st));
+                            CK(cudaMemcpy(ans.data() + 1 + (size_t) prev * N * 4, E.x, (size_t) (done - prev) * N * 4,
+                                          cudaMemcpyDeviceToHost));
+                            prev = done;
+                        });
+                        held.insert(held.end(), toks.begin(), toks.end());
+                        E.sess[(size_t) E.cur].pos = E.pos;
+                        tensor_from = 1;   // the rows go as a tensor: the node carries them in the hidden-state precision
+                    }
+                }
+            } else if (op == 'W' || op == 'V' || op == 'C') {
+                fail("this stage runs no verify windows (a Qwen3.6 split runs without MTP drafts)");
+            } else if (op == 'Q') {
+                quit = true;
+            } else {
+                fail(std::string("unknown request '") + op + "'");
+            }
+            if (!sl::send_msg(cfd, ans, tensor_from)) break;
+        }
+        ::close(cfd);
+        if (quit) {
+            ::close(lfd);
+            return 0;
+        }
+    }
+}
+#endif
+
 }  // namespace
 
 int strata::qwen35::run(int argc, char** argv) {
@@ -3732,6 +3946,10 @@ int strata::qwen35::run(int argc, char** argv) {
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false;
+    // a stage of a split model: the layers [stage_lo, stage_hi] (inclusive on the command line), served to the next
+    // stage (--stage-serve HOST:PORT) or reading the earlier stage's rows (--stage-prev HOST:PORT)
+    int64_t stage_lo = 0, stage_hi = -1;
+    std::string stage_listen, stage_prev;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -3772,6 +3990,18 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
+        else if (a == "--stage-layers") {
+            const std::string v = next();
+            long long lo = -1, hi = -1;
+            if (std::sscanf(v.c_str(), "%lld-%lld", &lo, &hi) != 2 || lo < 0 || hi < lo) {
+                std::fprintf(stderr, "strata-q36: --stage-layers takes LO-HI (inclusive, LO <= HI), not '%s'\n", v.c_str());
+                return 2;
+            }
+            stage_lo = lo;
+            stage_hi = hi;
+        }
+        else if (a == "--stage-serve") stage_listen = next();
+        else if (a == "--stage-prev") stage_prev = next();
         else if (serve_mode && a.rfind("--", 0) == 0) {
             // serve passes the config's args plus a few of its own: one this engine does not have is said and skipped
             // (with its value), not fatal
@@ -3798,11 +4028,39 @@ int strata::qwen35::run(int argc, char** argv) {
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) _putenv_s("CUDA_MODULE_LOADING", "EAGER");
 #endif
     if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "strata-q36: --mtp takes 0 .. 7 drafts\n"); return 2; }
+    const bool staged = stage_hi >= 0 || !stage_listen.empty() || !stage_prev.empty();
+    if (staged) {
+        // this family's stages: one session, no MTP drafts, no pictures (the first version of the split)
+        if (stage_hi < 0) { std::fprintf(stderr, "strata-q36: --stage-serve / --stage-prev need --stage-layers LO-HI\n"); return 2; }
+        if (!stage_listen.empty() && !stage_prev.empty()) {
+            std::fprintf(stderr, "strata-q36: a middle stage (--stage-serve with --stage-prev) is not supported for this family yet\n");
+            return 2;
+        }
+        if (stage_lo > 0 && stage_prev.empty()) { std::fprintf(stderr, "strata-q36: a stage after layer 0 needs --stage-prev\n"); return 2; }
+        if (stage_lo == 0 && stage_listen.empty()) { std::fprintf(stderr, "strata-q36: the first stage of a split runs as --stage-serve\n"); return 2; }
+        if (mtp_d > 0 || batch > 1 || batch_mtp || vision)
+            std::fprintf(stderr, "strata-q36: a stage runs one session without MTP drafts or pictures: --mtp / --batch / --vision ignored\n");
+        mtp_d = 0;
+        batch = 0;
+        batch_mtp = false;
+        vision = false;
+    }
     if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-q36: bad --chunk / --max-context\n"); return 2; }
     Model m;
     std::string err;
     try {
-        if (!load(model, m, err, mtp_d > 0)) { std::fprintf(stderr, "strata-q36: %s\n", err.c_str()); return 1; }
+        if (!load(model, m, err, mtp_d > 0, stage_lo, staged ? stage_hi + 1 : -1)) {
+            std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
+            return 1;
+        }
+        if (staged && !stage_listen.empty() && m.last_stage()) {
+            std::fprintf(stderr, "strata-q36: the last stage serves the requests (--serve with --stage-prev), not --stage-serve\n");
+            return 2;
+        }
+        if (staged && !stage_prev.empty() && !m.last_stage()) {
+            std::fprintf(stderr, "strata-q36: a stage before the last layer runs as --stage-serve\n");
+            return 2;
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-q36: %s\n", e.what());
         return 1;
@@ -3878,6 +4136,59 @@ int strata::qwen35::run(int argc, char** argv) {
     E.draft_n = std::max(0, draft_vocab);
     E.bmtp = (batch_mtp || (std::getenv("STRATA_BATCH_MTP") != nullptr && std::string(std::getenv("STRATA_BATCH_MTP")) != "0")) && E.n_sess > 1 && E.mtp_d > 0;
     if (batch_mtp && !E.bmtp) std::fprintf(stderr, "strata-q36: --batch-mtp needs --batch N (2 or more) and --mtp N: ignored\n");
+#if !defined(_WIN32)
+    if (!stage_listen.empty()) {
+        if (warm) E.warmup();
+        const char* tk = std::getenv("STRATA_STAGE_TOKEN");
+        return stage_serve(E, stage_listen, tk ? tk : "");
+    }
+    strata::stage::PrevStage prev;
+    std::string prev_token;
+    if (!stage_prev.empty()) {
+        const char* tk = std::getenv("STRATA_STAGE_PREV_TOKEN");
+        if (!tk) tk = std::getenv("STRATA_STAGE_TOKEN");
+        prev_token = tk ? tk : "";
+        // the earlier stage may still be loading: try for a while
+        std::string e;
+        bool up = false;
+        for (int attempt = 0; attempt < 600 && !up; ++attempt) {
+            up = prev.connect(stage_prev, prev_token, m.stage_lo, e);
+            if (!up) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        if (!up) {
+            std::fprintf(stderr, "strata-q36: the earlier stage at %s: %s\n", stage_prev.c_str(), e.c_str());
+            return 1;
+        }
+        if (prev.prompt_floats() != (uint32_t) m.g.n_embd) {
+            std::fprintf(stderr, "strata-q36: the earlier stage hands on rows of %u floats, this model's are %lld\n",
+                         prev.prompt_floats(), (long long) m.g.n_embd);
+            return 1;
+        }
+        std::fprintf(stderr, "strata-q36: reading layers 0-%lld through the earlier stage at %s\n",
+                     (long long) m.stage_lo - 1, stage_prev.c_str());
+        // the link drops: one reconnect before the request fails
+        auto again = [&](std::string& err) { return prev.connect(stage_prev, prev_token, m.stage_lo, err); };
+        E.rows_source = [&](const int32_t* toks, int T, int64_t p0, float* rows, std::string& err) {
+            std::vector<int64_t> t64(toks, toks + T);
+            strata::stage::PrevStage::Piece piece;
+            piece.pos0 = p0;
+            piece.n = T;
+            const bool ok = prev.stream_begin(t64.data(), {piece}, 1, err) && prev.stream_take(T, rows, err);
+            prev.stream_end();
+            return ok;
+        };
+        E.stage_resume = [&](const std::vector<int32_t>& ids, std::string& err) {
+            std::vector<int64_t> i64(ids.begin(), ids.end());
+            int how = 0;
+            return prev.resume(i64.data(), (int64_t) i64.size(), how, err);
+        };
+        E.stage_reset = [&](std::string& err) {
+            if (prev.reset(err)) return true;
+            return again(err) && prev.reset(err);
+        };
+        warm = false;   // a warm-up would read through the earlier stage before any request
+    }
+#endif
     if (warm) E.warmup();
     if (serve_mode) return serve(E);
     if (bench_pp > 0 || bench_tg > 0) {
