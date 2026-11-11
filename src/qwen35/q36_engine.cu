@@ -1040,6 +1040,9 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp, in
     };
     auto L = [](int64_t l, const char* s) { return "blk." + std::to_string(l) + "." + s; };
     if (hi < 0) hi = g.n_layers;
+    // The POM counts the GGUF's blocks, the MTP block included (block_count = n_layers + nextn): a last stage that
+    // ends on the MTP block is the last stage of the model's layers, with the MTP block beside its head.
+    if (lo < g.n_layers && hi > g.n_layers && hi <= g.n_layers + g.n_mtp_layers) hi = g.n_layers;
     if (lo < 0 || lo >= hi || hi > g.n_layers) {
         err = "--stage-layers " + std::to_string(lo) + "-" + std::to_string(hi - 1) + " is outside the model's layers 0-" +
               std::to_string(g.n_layers - 1);
