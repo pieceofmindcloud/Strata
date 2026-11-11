@@ -18,10 +18,12 @@
 // [--force IDS] [--dump-full-logits F] (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
 //
 // A STAGE OF A SPLIT (--stage-layers LO-HI, cut from the whole file): `layers` holds only those layers.  The first
-// stage runs --stage-serve HOST:PORT (src/program/stage_link.hpp's protocol: H Z R S P Q, the residual rows after
-// its last layer in each 'P' answer); the last runs --serve (or --tokens) with --stage-prev HOST:PORT and reads every
-// chunk's and every decoded token's rows from it before its own layers.  One session, no MTP drafts, no pictures,
-// no middle stage yet; 'R' continues only the earlier stage's live session (else both read from position 0).
+// stage runs --stage-serve HOST:PORT (src/program/stage_link.hpp's protocol: H Z R S P W V C Q, the residual rows
+// after its last layer in each 'P' and window answer); the last runs --serve (or --tokens) with --stage-prev
+// HOST:PORT and reads every chunk's and every decoded token's rows from it before its own layers.  The MTP block
+// lives on the last stage (with the head and an embedding of its own): a speculative step's verify window goes
+// through the earlier stage ('W', its commit folded into the next window as 'V').  One session, no pictures, no
+// middle stage yet; 'R' continues only the earlier stage's live session (else both read from position 0).
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/kernels/fused_gdn.hpp"
@@ -1048,10 +1050,10 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp, in
     const bool whole = m.first_stage() && m.last_stage();
     m.layers.resize((size_t) (hi - lo));
     // the MTP block whenever the file has one, with or without drafts (--mtp): the VRAM it takes is then the same
-    // either way, so the hybrid mode's slot tables - and with them the greedy text - do not depend on --mtp.  A stage
-    // of a split runs without it (the drafts would need the whole model's hidden state on the last stage).
+    // either way, so the hybrid mode's slot tables - and with them the greedy text - do not depend on --mtp.  On a
+    // split it belongs to the last stage, which holds the final hidden state and the head (and then the embedding too).
     (void) want_mtp;
-    m.has_mtp = g.n_mtp_layers > 0 && whole;
+    m.has_mtp = g.n_mtp_layers > 0 && m.last_stage();
     for (int64_t l = lo; l < hi + (m.has_mtp ? 1 : 0); ++l) {
         const bool is_mtp = l == g.n_layers;
         Layer& y = is_mtp ? m.mtp : m.layers[(size_t) (l - lo)];
@@ -1122,7 +1124,7 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp, in
         m.out_norm = f32("output_norm.weight");
         m.head = mat("output.weight");
     }
-    if (m.first_stage()) {
+    if (m.first_stage() || m.has_mtp) {   // a later stage reads it for the MTP block only
         size_t s = 0;
         const strata::TensorInfo* t = find("token_embd.weight", s);
         m.embd_type = (int) t->type;
@@ -2472,6 +2474,10 @@ struct Engine {
     /// state, the request reads from position 0), or starts over.
     std::function<bool(const std::vector<int32_t>& ids, std::string& err)> stage_resume;
     std::function<bool(std::string& err)> stage_reset;
+    /// A later stage's verify window: the earlier stage's rows of T tokens at p0 (its state left for the commit), and
+    /// the commit of the first n_keep of them.
+    std::function<bool(const int32_t* toks, int T, int64_t p0, float* rows, std::string& err)> stage_window;
+    std::function<bool(int n_keep, std::string& err)> stage_commit;
     bool stage_failed = false;   ///< the last process() stopped because the earlier stage did not answer
     std::string stage_err;
     std::vector<float> stage_rows;
@@ -2796,8 +2802,21 @@ struct Engine {
         hpin[1] = (int32_t) pos;
         CK(cudaMemcpyAsync(tok, hpin + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
+        if (stage_window) {   // a later stage: the window's rows through the earlier stage first
+            std::vector<int32_t> wt(hpin + 16, hpin + 16 + T);
+            stage_rows.resize((size_t) T * N);
+            stage_err.clear();
+            if (!stage_window(wt.data(), T, pos, stage_rows.data(), stage_err)) {
+                stage_failed = true;
+                if (stage_err.empty()) stage_err = "the earlier stage did not answer a verify window";
+                picks[0] = x_tok;
+                return 0;
+            }
+            CK(cudaMemcpyAsync(x, stage_rows.data(), stage_rows.size() * 4, cudaMemcpyHostToDevice, st));
+        }
         rows_deferred = true;
-        graph_run(gs().gv[T], [&] { forward(T, pos, T, use_graph, true); });
+        if (stage_window) forward(T, pos, T, false, true);
+        else graph_run(gs().gv[T], [&] { forward(T, pos, T, use_graph, true); });
         rows_deferred = false;
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
@@ -2806,6 +2825,13 @@ struct Engine {
         if (cancel != nullptr && cancel->load()) a = 0;
         for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
         commit(a + 1);
+        if (stage_commit) {
+            stage_err.clear();
+            if (!stage_commit(a + 1, stage_err)) {
+                stage_failed = true;
+                if (stage_err.empty()) stage_err = "the earlier stage did not take a commit";
+            }
+        }
         CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         pos += a + 1;
         after_rows(a + 1);
@@ -3721,6 +3747,12 @@ struct Serve {
             if (n_active > 0) window();
             if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
                 const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop);
+                if (E.stage_failed) {   // the earlier stage stopped answering: the answer ends, the state starts over
+                    std::fprintf(stderr, "strata-q36 stage: %s\n", E.stage_err.c_str());
+                    ss.live.clear();
+                    finish = "cancel";
+                    break;
+                }
                 offered += E.mtp_d;
                 accepted += a;
                 // the state now holds x and every accepted draft, whether or not the answer ends inside them (an end of
@@ -3835,7 +3867,47 @@ int stage_serve(Engine& E, const std::string& listen, const std::string& token) 
     std::printf("READY stage\n");
     std::fflush(stdout);
     std::vector<int32_t> held;   // the tokens the live session holds
+    std::vector<int32_t> win;    // the tokens of the verify window not committed yet (empty: none open)
     std::vector<char> req, ans;
+    // A verify window: its rows (the state left for the commit) into ans after the status byte.
+    auto run_window = [&](int64_t pos0, const std::vector<int32_t>& toks, std::string& e) -> bool {
+        const int T = (int) toks.size();
+        if (T < 1 || T > Engine::kVerify) { e = "a verify window of " + std::to_string(T) + " tokens"; return false; }
+        if (pos0 != E.pos || pos0 + T > E.ctx) {
+            e = "a verify window at position " + std::to_string(pos0) + ", but this stage is at " + std::to_string(E.pos);
+            return false;
+        }
+        CK(cudaStreamSynchronize(E.st));
+        for (int i = 0; i < T; ++i) E.hpin[16 + i] = toks[(size_t) i];
+        E.hpin[1] = (int32_t) E.pos;
+        CK(cudaMemcpyAsync(E.tok, E.hpin + 16, (size_t) T * 4, cudaMemcpyHostToDevice, E.st));
+        CK(cudaMemcpyAsync(E.pos0, E.hpin + 1, 4, cudaMemcpyHostToDevice, E.st));
+        E.rows_deferred = true;
+        E.forward(T, E.pos, 0, false, true);
+        E.rows_deferred = false;
+        CK(cudaStreamSynchronize(E.st));
+        const size_t at0 = ans.size();
+        ans.resize(at0 + (size_t) T * N * 4);
+        CK(cudaMemcpy(ans.data() + at0, E.x, (size_t) T * N * 4, cudaMemcpyDeviceToHost));
+        win = toks;
+        return true;
+    };
+    // The open window's first n tokens kept.
+    auto commit_window = [&](uint32_t n, std::string& e) -> bool {
+        if (win.empty() || n < 1 || n > win.size()) {
+            e = "a commit of " + std::to_string(n) + " tokens without a window that long";
+            win.clear();
+            return false;
+        }
+        E.commit((int) n);
+        CK(cudaStreamSynchronize(E.st));
+        held.insert(held.end(), win.begin(), win.begin() + n);
+        E.pos += n;
+        E.after_rows((int) n);
+        E.sess[(size_t) E.cur].pos = E.pos;
+        win.clear();
+        return true;
+    };
     for (;;) {
         const int cfd = ::accept(lfd, nullptr, nullptr);
         if (cfd < 0) {
@@ -3851,6 +3923,7 @@ int stage_serve(Engine& E, const std::string& listen, const std::string& token) 
             const char op = req.empty() ? 0 : req[0];
             ans.assign(1, (char) 0);
             size_t tensor_from = 0;
+            if (!win.empty() && op != 'C' && op != 'V') win.clear();   // a window never committed: the state stays
             auto fail = [&](const std::string& e) {
                 ans.assign(1, (char) 1);
                 sl::put_bytes(ans, e.data(), e.size());
@@ -3868,7 +3941,7 @@ int stage_serve(Engine& E, const std::string& listen, const std::string& token) 
                 sl::put<uint32_t>(ans, (uint32_t) E.m->stage_hi);
                 sl::put<uint32_t>(ans, (uint32_t) N);   // window rows (no windows are run, the width is the same)
                 sl::put<uint32_t>(ans, (uint32_t) N);   // prompt rows: the residual after the stage's last layer
-                sl::put<uint32_t>(ans, 0u);             // features: no 'V'
+                sl::put<uint32_t>(ans, sl::PrevStage::kFoldCommit);   // this server takes 'V'
             } else if (op == 'Z') {
                 E.reset();
                 held.clear();
@@ -3919,8 +3992,29 @@ int stage_serve(Engine& E, const std::string& listen, const std::string& token) 
                         tensor_from = 1;   // the rows go as a tensor: the node carries them in the hidden-state precision
                     }
                 }
-            } else if (op == 'W' || op == 'V' || op == 'C') {
-                fail("this stage runs no verify windows (a Qwen3.6 split runs without MTP drafts)");
+            } else if (op == 'W' || op == 'V') {
+                int64_t pos0 = 0;
+                uint32_t T = 0, keep = 0;
+                std::string e;
+                bool ok = sl::get(req, at, pos0) && sl::get(req, at, T) && req.size() >= at + (size_t) T * 4;
+                std::vector<int32_t> toks;
+                if (ok) {
+                    toks.resize(T);
+                    std::memcpy(toks.data(), req.data() + at, (size_t) T * 4);
+                    at += (size_t) T * 4;
+                    if (op == 'V') ok = sl::get(req, at, keep);
+                }
+                if (!ok) fail("a malformed verify window");
+                else if (op == 'V' && !commit_window(keep, e)) fail(e);
+                if (ok && ans.size() == 1 && ans[0] == 0) {
+                    if (!run_window(pos0, toks, e)) fail(e);
+                    else tensor_from = 1;
+                }
+            } else if (op == 'C') {
+                uint32_t n = 0;
+                std::string e;
+                if (!sl::get(req, at, n)) fail("a malformed commit");
+                else if (!commit_window(n, e)) fail(e);
             } else if (op == 'Q') {
                 quit = true;
             } else {
@@ -4038,9 +4132,9 @@ int strata::qwen35::run(int argc, char** argv) {
         }
         if (stage_lo > 0 && stage_prev.empty()) { std::fprintf(stderr, "strata-q36: a stage after layer 0 needs --stage-prev\n"); return 2; }
         if (stage_lo == 0 && stage_listen.empty()) { std::fprintf(stderr, "strata-q36: the first stage of a split runs as --stage-serve\n"); return 2; }
-        if (mtp_d > 0 || batch > 1 || batch_mtp || vision)
-            std::fprintf(stderr, "strata-q36: a stage runs one session without MTP drafts or pictures: --mtp / --batch / --vision ignored\n");
-        mtp_d = 0;
+        if (batch > 1 || batch_mtp || vision)
+            std::fprintf(stderr, "strata-q36: a stage runs one session without pictures: --batch / --batch-mtp / --vision ignored\n");
+        if (mtp_d > 0 && !stage_listen.empty()) mtp_d = 0;   // the drafts belong to the last stage
         batch = 0;
         batch_mtp = false;
         vision = false;
@@ -4182,6 +4276,10 @@ int strata::qwen35::run(int argc, char** argv) {
             int how = 0;
             return prev.resume(i64.data(), (int64_t) i64.size(), how, err);
         };
+        E.stage_window = [&](const int32_t* toks, int T, int64_t p0, float* rows, std::string& err) {
+            return prev.window(T, toks, p0, rows, err);
+        };
+        E.stage_commit = [&](int n_keep, std::string& err) { return prev.commit(n_keep, err); };
         E.stage_reset = [&](std::string& err) {
             if (prev.reset(err)) return true;
             return again(err) && prev.reset(err);
@@ -4245,6 +4343,7 @@ int strata::qwen35::run(int argc, char** argv) {
             gen.push_back(nx);
             if ((int) gen.size() >= n_gen) break;
             const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks);
+            if (E.stage_failed) { std::fprintf(stderr, "strata-q36 stage: %s\n", E.stage_err.c_str()); break; }
             offered += E.mtp_d;
             accepted += a;
             fix.assign(drafts.begin(), drafts.begin() + a);
