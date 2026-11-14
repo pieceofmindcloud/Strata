@@ -55,7 +55,8 @@ class Apply(unittest.TestCase):
         for changes in ({"api_key": "x"}, {"host": "0.0.0.0"}, {"mcp_servers": {}}, {"before_load": "calc.exe"},
                         {"args": []}, {"exe": "evil.exe"}, {"trusted_origins": ["*"]}, {"allowed_hosts": ["*"]},
                         {"sampling.temperature": -1}, {"sampling.top_p": 0}, {"sampling.top_k": 65},
-                        {"sampling.min_p": 2}, {"reasoning_budget_tokens": 1.5}, {"fit_max_tokens": "yes"},
+                        {"sampling.min_p": 2}, {"sampling.presence_penalty": -0.5},
+                        {"reasoning_budget_tokens": 1.5}, {"fit_max_tokens": "yes"},
                         {"effort_position": "middle"}, {"vram_reserve_mib": -5}, {"idle_unload_s": True},
                         {"aliases": [1]}, {}, None, ["x"]):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
@@ -64,6 +65,13 @@ class Apply(unittest.TestCase):
             runconfig.apply(CFG, {"fit_max_tokens": True, "sampling.top_k": 0})
         with self.assertRaises(ValueError):
             runconfig.apply({**CFG, "vision": {"gpu": True}}, {"lazy_load": True})
+
+    def test_presence_penalty_is_a_sampling_default(self):
+        new, changed = runconfig.apply(CFG, {"sampling.presence_penalty": 0})
+        self.assertEqual(changed, ["sampling.presence_penalty"])
+        self.assertEqual(new["sampling"], {"temperature": 0.7, "presence_penalty": 0.0})
+        got = {k["key"]: k for k in runconfig.view(CFG, "x.json")["keys"]}
+        self.assertEqual(got["sampling.presence_penalty"]["value"], 1.5)
 
     def test_view(self):
         v = runconfig.view({**CFG, "args": CFG["args"] + ["--vram-reserve-mib", "1500"]}, "x/strata-q2_0.json")

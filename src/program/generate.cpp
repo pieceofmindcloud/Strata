@@ -821,6 +821,9 @@ struct Options {
     int64_t prefill_auto_cap = 0;
     /// a bare `--prefill auto` (no ":N", no STRATA_PREFILL_AUTO_MAX): the gfx12 Linux rule below may raise its ceiling
     bool prefill_auto_bare = false;
+    /// a stage server's `--prefill auto`: its prompt path keeps its own buffers (no loan), and the auto cache sizing
+    /// picks the chunk that streams the fewest expert bytes per prompt token (STAGE CHUNK below), not a fixed one
+    bool stage_chunk_auto = false;
     /// 0.2.8 (Strix Halo on Windows): the prompt path keeps its own buffers by default (no lending), so `--prefill auto`
     /// must not fall back to 2048 ("reserved buffers, keep them small") - the gfx1151 rule above has already chosen a
     /// chunk that fits this box's carve-out.
@@ -4562,9 +4565,13 @@ int main(int argc, char** argv) {
             // The `--prefill auto` rule above (nothing to lend from: small buffers) ran before this turned borrowing
             // off, so the auto chunk stayed at its NVIDIA 32768: the cache sizing then priced the prompt path's own
             // buffers at ~21.9 GiB, no slot was left on a 16 GB card and the verify window refused to start.
+            // The chunk is now sized with the cache (STAGE CHUNK, in the auto cache sizing): 2048 stays only as the
+            // provisional figure the sizing starts from, and the chunk of a start that skips it (an explicit
+            // --expert-cache or --vram-reserve-mib).
             if (o.prefill_auto) {
                 o.prefill_auto = false;
                 o.prefill_chunk = 2048;
+                o.stage_chunk_auto = true;
             }
         }
         std::fprintf(stderr, "strata generate: stage of layers %lld-%lld (%s)\n", (long long) o.stage_lo,
@@ -8157,6 +8164,73 @@ int main(int argc, char** argv) {
                 o.vram_reserve_mib = kWddmAutoReserveMib;
             }
 #endif
+        }
+        // STAGE CHUNK.  A stage server's prompt path keeps its own buffers (it has no loan to give back between reads), so
+        // its chunk and its expert cache share the card: a bigger chunk takes VRAM from the cache.  A chunk of
+        // stream_all_min tokens or more streams, once per chunk, every expert of the stage the cache does not hold, so the
+        // expert bytes a prompt token costs are (pairs not resident) / chunk.  The fixed 2048 this replaces (which kept the
+        // cache large) streamed the same missing experts again for every 2K tokens: on a 16 GB RTX 5060 Ti stage of 28
+        // layers a 128K prompt moved 624 GB over PCIe, against 414 GB for the whole 48-layer model on one card with the
+        // loan (POM pipeline, 2026-11-13).  So the chunk is the one on the 256-token grid, up to auto's ceiling, with the
+        // fewest streamed bytes per prompt token, while the cache keeps at least STRATA_STAGE_CACHE_KEEP percent (75 by
+        // default) of the slots it has at the smallest chunk: the decode windows read the cache, and without that floor
+        // the fewest bytes per token always lands on the largest chunk and a nearly empty cache.  A chunk whose cache
+        // holds every pair of the stage streams nothing; the largest of those wins.  The buffers are priced the way
+        // owned_prefill_mib prices them.
+        if (o.stage_chunk_auto && auto_cache && !pf_borrow && !profile.empty()) {   // with the reserve the start keeps, given or not
+            const int64_t sc_blob = (int64_t) nibble_max_slot_bytes();
+            const int64_t sc_pairs = (int64_t) profile.size();
+            const int64_t sc_late = strata::qwen_defaults_026() ? 0 : strata::core::kLateAllocMib;
+            static const bool sc_exact = [] { const char* v = std::getenv("STRATA_OWNED_PRICE"); return v != nullptr && std::string(v) == "exact"; }();
+            auto sc_own_mib = [&](int64_t c) -> int64_t {
+                if (!sc_exact) return 160 + (c * 680) / 1024;
+                return (((int64_t) strata::prefill::Prefill::bytes_needed_owned(g, ss, c, srcp != nullptr) + (1 << 20) - 1) >> 20) + 64;
+            };
+            // how many of the profile's pairs, hottest first, the room holds: a native pack's slots are each layer's own
+            // blob (the sized-slots loop below lays them out the same way), so the largest blob would undercount them by a
+            // third and keep the chunk small while VRAM stays free
+            std::vector<int64_t> sc_cum;   // sc_cum[i]: bytes of the first i + 1 pairs
+            sc_cum.reserve(profile.size());
+            {
+                int64_t acc = 0;
+                for (const auto& pr : profile) {
+                    acc += native_pack ? strata::core::ExpertCache::slot_stride((int64_t) nib::slot_bytes(pr.first), slot_guard)
+                                       : sc_blob;
+                    sc_cum.push_back(acc);
+                }
+            }
+            auto sc_slots = [&](int64_t c) -> int64_t {
+                const int64_t room = (int64_t) free_b - pipe_first - (((int64_t) o.vram_reserve_mib + sc_own_mib(c) + sc_late) << 20);
+                if (room <= 0) return 0;
+                return (int64_t) (std::upper_bound(sc_cum.begin(), sc_cum.end(), room) - sc_cum.begin());
+            };
+            int64_t keep_pct = 75;
+            if (const char* kp = std::getenv("STRATA_STAGE_CACHE_KEEP"); kp != nullptr && kp[0] != '\0')
+                keep_pct = std::clamp<int64_t>(std::atoll(kp), 0, 100);
+            int64_t ceiling = std::min<int64_t>(o.prefill_auto_max, o.max_context);
+            if (o.prefill_auto_cap > 0) ceiling = std::min<int64_t>(ceiling, o.prefill_auto_cap);
+            const int64_t base = sc_slots(256);
+            const int64_t keep = std::max<int64_t>(64, base * keep_pct / 100);
+            int64_t best_c = 0, best_s = 0;
+            double best_cost = 0.0;
+            for (int64_t c = 256; c <= ceiling; c += 256) {
+                const int64_t s_c = sc_slots(c);
+                if (s_c < keep) break;   // the cache only shrinks as the chunk grows
+                const double cost = (double) (sc_pairs - s_c) / (double) c;
+                if (best_c == 0 || cost <= best_cost) { best_c = c; best_s = s_c; best_cost = cost; }
+            }
+            if (best_c > 0) {
+                const double sc_avg = sc_cum.empty() ? (double) sc_blob : (double) sc_cum.back() / (double) sc_cum.size();
+                const int64_t was_s = sc_slots(o.prefill_chunk);
+                std::fprintf(stderr, "strata generate: stage chunk auto: %lld tokens (own buffers %lld MiB), the cache keeps %lld of %lld "
+                                     "slots (at least %lld%%: %lld): about %.0f MiB of experts streamed per 1K prompt tokens, against "
+                                     "%.0f MiB at the 2048-token chunk (STRATA_STAGE_CACHE_KEEP sets the floor)\n",
+                             (long long) best_c, (long long) sc_own_mib(best_c), (long long) best_s, (long long) base,
+                             (long long) keep_pct, (long long) keep,
+                             best_cost * 1024.0 * sc_avg / 1048576.0,
+                             (double) (sc_pairs - was_s) / (double) o.prefill_chunk * 1024.0 * sc_avg / 1048576.0);
+                o.prefill_chunk = best_c;
+            }
         }
         const int64_t prefill_mib = owned_prefill_mib();
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
@@ -11923,9 +11997,16 @@ int main(int argc, char** argv) {
                     [&](int n, std::string& e) { return stage_prev.commit(n, e); }, stage_hand_in);
                 // a prompt chunk goes in pieces of STRATA_STAGE_PIECE tokens (1024 by default): one piece's rows
                 // (~40 KB a token) are one frame of the link, which a relay between the machines may carry whole
-                static const int64_t piece = [] {
+                // Not set: the largest piece on the 256-token grid whose rows fit kStagePieceFrame (the POM relay takes frames
+                // of up to 64 MiB, plugin_stage_link MAX_FRAME; 60 MiB leaves room for the header), at least 1024 tokens and at
+                // most 4096.  A middle stage reads a piece at a time when nothing is waiting behind it, so a bigger piece is a
+                // bigger read (Flash-Next: ~40 KB of rows a token, 1536 tokens a piece).
+                const int64_t piece = [&] {
                     const char* v = std::getenv("STRATA_STAGE_PIECE");
-                    return v != nullptr && std::atoll(v) > 0 ? (int64_t) std::atoll(v) : (int64_t) 1024;
+                    if (v != nullptr && std::atoll(v) > 0) return (int64_t) std::atoll(v);
+                    constexpr int64_t kStagePieceFrame = (int64_t) 60 << 20;
+                    const int64_t per = std::max<int64_t>((int64_t) stage_prev.prompt_floats() * (int64_t) sizeof(float), 1);
+                    return std::clamp<int64_t>(kStagePieceFrame / per / 256 * 256, 1024, 4096);
                 }();
                 // THE MICRO-PIPELINE: a run's pieces are asked for ahead (remote_prev_begin, set with the prompt cache's
                 // checkpoints below), up to STRATA_STAGE_INFLIGHT pieces (8 by default, 1 = one at a time) and
@@ -16027,9 +16108,18 @@ int main(int argc, char** argv) {
                                 }
                             }
                             if (o.stage_lo > 0) {
-                                while ((int) batch.size() < std::max(stage_depth, 1)) {
+                                // the pieces the later stage sends ahead come a few ms apart over the network: wait for them
+                                // as the first stage does, so the batch read in one pass below is more than one piece
+                                const auto mid_until =
+                                    std::chrono::steady_clock::now() + std::chrono::milliseconds(join_pieces ? join_wait_ms : 0);
+                                // a piece that saves a checkpoint ends a batch read in one pass (its save is the stream's last piece)
+                                while ((int) batch.size() < std::max(stage_depth, 1) && !(join_pieces && batch.back().save)) {
+                                    const int left = (int) std::max<int64_t>(
+                                        0, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               mid_until - std::chrono::steady_clock::now())
+                                               .count());
                                     pollfd pfd{cfd, POLLIN, 0};
-                                    if (::poll(&pfd, 1, 0) <= 0 || (pfd.revents & POLLIN) == 0) break;
+                                    if (::poll(&pfd, 1, left) <= 0 || (pfd.revents & POLLIN) == 0) break;
                                     std::vector<char> more;
                                     if (!sl::recv_msg(cfd, more)) {
                                         lost = true;
@@ -16048,15 +16138,33 @@ int main(int argc, char** argv) {
                                 std::vector<int64_t> all;
                                 std::vector<sl::PrevStage::Piece> pieces;
                                 const int64_t step = std::max<int64_t>(1, sp.chunk());
-                                for (const PPiece& pc : batch) {
-                                    all.insert(all.end(), pc.toks.begin(), pc.toks.end());
-                                    for (int64_t a0 = 0; a0 < (int64_t) pc.n; a0 += step)
-                                        pieces.push_back({pc.pos0 + a0, std::min<int64_t>(step, (int64_t) pc.n - a0),
-                                                          pc.save && a0 + step >= (int64_t) pc.n});
+                                if (join_pieces && batch.size() > 1) {
+                                    // read in one pass below: the stream follows that pass's chunks, which run across the
+                                    // gathered pieces from the first one's position ("the stage stream's pieces do not end
+                                    // where the chunk ends" otherwise)
+                                    for (const PPiece& pc : batch) all.insert(all.end(), pc.toks.begin(), pc.toks.end());
+                                    // each chunk asked for in pieces of the link's size (stage_piece): a piece is one frame
+                                    // of the POM relay (64 MiB), and stream_take joins pieces up to a chunk's end
+                                    const int64_t n_all = (int64_t) all.size();
+                                    const int64_t link_piece = stage_piece > 0 ? std::min<int64_t>(stage_piece, step) : step;
+                                    for (int64_t a0 = 0; a0 < n_all; a0 += step) {
+                                        const int64_t c_end = std::min<int64_t>(a0 + step, n_all);
+                                        for (int64_t b0 = a0; b0 < c_end; b0 += link_piece)
+                                            pieces.push_back({batch.front().pos0 + b0, std::min<int64_t>(link_piece, c_end - b0),
+                                                              batch.back().save && b0 + link_piece >= n_all});
+                                    }
+                                } else {
+                                    for (const PPiece& pc : batch) {
+                                        all.insert(all.end(), pc.toks.begin(), pc.toks.end());
+                                        for (int64_t a0 = 0; a0 < (int64_t) pc.n; a0 += step)
+                                            pieces.push_back({pc.pos0 + a0, std::min<int64_t>(step, (int64_t) pc.n - a0),
+                                                              pc.save && a0 + step >= (int64_t) pc.n});
+                                    }
                                 }
                                 std::string serr;
                                 if (stage_prev.stream_begin(all.data(), std::move(pieces), stage_depth, serr)) {
                                     stage_stream_external = true;
+                                    joined = (int64_t) all.size();
                                     batch_tokens.swap(all);   // the stream reads them until it ends
                                 } else {
                                     fail(serr);
@@ -16064,7 +16172,12 @@ int main(int argc, char** argv) {
                                 }
                             }
                             bool failed = ans[0] != 0;
-                            if (o.stage_lo == 0 && batch.size() > 1 && !failed) {
+                            // A middle stage too (STRATA_STAGE_JOIN_PIECES=0: a piece at a time, as before): it read every
+                            // gathered piece apart, so its prompt path ran 1024-token reads whatever its chunk, and the
+                            // experts its cache does not hold came in again for each (an RX 7800 XT middle stage of a
+                            // three-stage Flash-Next read the prompt at a third of the 5060 Ti first stage's speed per
+                            // layer).  The stream opened above brings the earlier stage's rows in this stage's chunk steps.
+                            if ((o.stage_lo == 0 || (stage_stream_external && join_pieces)) && batch.size() > 1 && !failed) {
                                 // One pass over the joined pieces; each piece is answered as soon as its rows are out.
                                 const int64_t pos0 = batch.front().pos0;
                                 std::vector<int64_t> all;

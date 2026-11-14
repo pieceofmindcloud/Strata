@@ -24,6 +24,9 @@ EDITABLE = [
     ("sampling.top_p", ("sampling", "0<x<=1"), "Default top_p for requests that send none"),
     ("sampling.top_k", ("sampling", "1..64"), "Default top_k for requests that send none (1-64)"),
     ("sampling.min_p", ("sampling", "0<=x<=1"), "Default min_p for requests that send none"),
+    ("sampling.presence_penalty", ("sampling", "num>=0"),
+     "Default presence_penalty for requests that send none (empty: the model card's, 1.5 on Qwen without thinking; "
+     "0 lets the Qwen3.6 engine draft with its MTP block, which it does only for greedy requests without penalties)"),
     ("reasoning_budget_tokens", "int>=0", "Cap the thinking of every request at this many tokens (0 or empty: no cap)"),
     ("fit_max_tokens", "bool", "Shorten a max_tokens that does not fit the context (on by default); off: answer 400 like llama.cpp"),
     ("reasoning_effort", ("enum", ["none", "low", "medium", "high"]),
