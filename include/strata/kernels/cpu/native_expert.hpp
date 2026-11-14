@@ -36,6 +36,10 @@ enum class NativeArithmetic { Default, WindowInvariant };
 /// One layer's native expert geometry.
 struct NativeFmt {
     int gu_type = -1, d_type = -1;      ///< ggml types of gate/up and of down
+    /// The up rows' type when it differs from the gate's (a mixed layer, e.g. Unsloth's UD quants: gate IQ2_S, up
+    /// IQ2_XXS); equal to gu_type otherwise. The gate rows stay at 0 with gu_row, the up rows at up_off with u_row.
+    int u_type = -1;
+    size_t u_row = 0;
     int gu_act = -1, d_act = -1;        ///< their vec_dot_type (the activation formats)
     int64_t n_embd = 0, n_ff = 0;
     size_t gu_row = 0, d_row = 0;       ///< bytes per weight row
@@ -61,7 +65,9 @@ constexpr size_t kNvfp4Tail = 16;
 /// Whether this build has the ggml-cpu path.
 bool native_experts_available() noexcept;
 /// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type.
-bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
+bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err, int u_type = -1);
+/// A layer whose up rows have another type than its gate rows.
+inline bool native_mixed(const NativeFmt& f) { return f.u_type >= 0 && f.u_type != f.gu_type; }
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes), rotated first when the layer is Hadamard-folded.
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);

@@ -454,8 +454,15 @@ def expert_layout(model: Model, src: pathlib.Path):
         if any(t.expected_bytes() is None or len(t.shape) != 3 or int(t.shape[2]) != n_expert for t in ts):
             return "layer %d: an expert tensor is not [*, *, %d] of whole blocks" % (l, n_expert)
         per = [t.expected_bytes() // n_expert for t in ts]
-        if per[0] != per[1] or ts[0].type_name != ts[1].type_name:
-            return "layer %d: gate and up differ in type" % l
+        # gate and up of different types (Unsloth's UD quants mix them per layer, e.g. IQ2_S gate + IQ2_XXS up): the
+        # blob is still [gate | up | down], each role in its own type, and the gate/up column reads "gate/up" (an engine
+        # without mixed layers refuses that line instead of misreading it). Not for NVFP4, whose tails assume one type.
+        mixed = ts[0].type_name != ts[1].type_name
+        if mixed and "NVFP4" in (ts[0].type_name, ts[1].type_name):
+            return "layer %d: NVFP4 gate and up of different types" % l
+        gu_col = "%d/%d" % (ts[0].type_id, ts[1].type_id) if mixed else "%d" % ts[0].type_id
+        if mixed:
+            print("layer %d: gate %s, up %s (a mixed layer)" % (l, ts[0].type_name, ts[1].type_name))
         blob = per[0] + per[1] + per[2]
         nvfp4 = ts[0].type_name == "NVFP4" or ts[2].type_name == "NVFP4"
         if nvfp4:
@@ -473,10 +480,10 @@ def expert_layout(model: Model, src: pathlib.Path):
         column = files[0] if len(set(files)) == 1 else ",".join(files)
         n_split += len(set(files)) != 1
         if nvfp4:   # no GGUF offsets: experts.bin is the only source that carries the scale tails
-            lines.append("%d %d %d %d %d" % (l, ts[0].type_id, ts[2].type_id, offset, blob))
+            lines.append("%d %s %d %d %d" % (l, gu_col, ts[2].type_id, offset, blob))
             offset += blob * n_expert
             continue
-        line = "%d %d %d %d %d %d %d %d" % (l, ts[0].type_id, ts[2].type_id, offset, blob,
+        line = "%d %s %d %d %d %d %d %d" % (l, gu_col, ts[2].type_id, offset, blob,
                                             *[w[0].data_start + w[1].offset for w in ws])
         lines.append(line + ("" if not column else " " + column))
         offset += blob * n_expert

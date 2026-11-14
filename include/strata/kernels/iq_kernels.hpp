@@ -38,11 +38,13 @@ void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int
 /// s_down, 0}; gate rows are scaled by s_gate and up rows by s_up (s_down goes on the down matrix: folded into up,
 /// the up weights would sit near 1e-8, deep in FP16's subnormals).
 void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,
-                       void* stream, const float* tail = nullptr);
+                       void* stream, const float* tail = nullptr, int up_type = -1);
 
 /// The layout of one native expert blob: [gate rows | up rows | down rows], raw GGUF blocks.
 struct NativeExpertLayout {
     int gu_type = -1, d_type = -1;
+    int u_type = -1;                    // the up rows' type when it differs from the gate's (a mixed layer), else -1
+    size_t u_row = 0;                   // their row bytes (0 when not mixed)
     int64_t n_embd = 0, n_ff = 0;
     size_t gu_row = 0, d_row = 0;       // bytes per row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
@@ -55,7 +57,7 @@ struct NativeExpertLayout {
                                         // slot); set only by native_expert_layout_nib
     const float* d_signs = nullptr;
 };
-NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
+NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int u_type = -1);
 /// STRATA_EXPERT_NIBBLE: a converted VRAM slot - gate/up as 4-bit codes, scales and d (expert_nibble.hpp's layout:
 /// up_off = the up rows' codes, down_off = kGuBytes, bytes = the slot), the GGUF down rows after them.  IQ2_S /
 /// IQ3_XXS / IQ3_S at n_embd 2560, n_ff 640 only, and only in a build with the kernels (`native_expert_nib_supported`).
@@ -63,7 +65,7 @@ NativeExpertLayout native_expert_layout_nib(int gu_type, int d_type, int64_t n_e
 bool native_expert_nib_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept;
 /// Whether `native_expert_grouped` has kernels for this gate/up and down type pair at these dimensions, and the
 /// prompt path's dequantizer takes both (checked for every layer at startup, before anything is allocated).
-bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept;
+bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int u_type = -1) noexcept;
 
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);

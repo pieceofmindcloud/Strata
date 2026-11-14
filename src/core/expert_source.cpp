@@ -1725,7 +1725,7 @@ bool FileExpertSource::open_gguf(std::string& err) {
     for (int64_t l = 0; l < n_layers_; ++l) {
         if (lay.bytes[(size_t) l] == 0) continue;   // a layer slice's pack: another stage's layer
         const auto& fm = lay.fmt[(size_t) l];
-        const uint64_t per[3] = {fm.up_off, fm.up_off, lay.bytes[(size_t) l] - fm.down_off};
+        const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, lay.bytes[(size_t) l] - fm.down_off};
         for (int r = 0; r < 3; ++r) {
             const size_t i = (size_t) (3 * l + r);
             const std::string path = lay.gguf_file.size() > i && !lay.gguf_file[i].empty() ? dir + lay.gguf_file[i]
@@ -5666,14 +5666,14 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
             if (lay.bytes[(size_t) l] == 0) continue;   // a layer slice's pack: another stage's layer
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
-            const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
+            const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};
             for (int r = 0; r < 3; ++r) {
                 const std::string path = expert_gguf_file(gguf, lay, l, r);
                 auto& f = files[path];
                 if (!f) f = std::make_unique<strata::GgufFile>(path);
                 const std::string name = "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight";
                 const strata::TensorInfo* t = f->find(name);
-                const uint64_t want_type = (uint64_t) (r < 2 ? fm.gu_type : fm.d_type);
+                const uint64_t want_type = (uint64_t) (r == 0 ? fm.gu_type : r == 1 ? fm.u_type : fm.d_type);
                 // GGUF order: dim 0 is the row (the input), dim 1 the rows, dim 2 the experts
                 const uint64_t cols = (uint64_t) (r < 2 ? fm.n_embd : fm.n_ff);
                 const uint64_t rows = (uint64_t) (r < 2 ? fm.n_ff : fm.n_embd);
@@ -5760,7 +5760,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
                 wait_ready(l);
                 const auto& fm = lay.fmt[(size_t) l];
                 const uint64_t blob = lay.bytes[(size_t) l];
-                const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
+                const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};
                 const uint64_t at[3] = {0, fm.up_off, fm.down_off};
                 for (int r = 0; r < 3 && !bad; ++r) {
                     // the handle is kept while consecutive roles share a file (every layer of a v3 pack)
@@ -5840,7 +5840,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
             wait_ready(l);
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
-            const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
+            const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};
             const uint64_t at[3] = {0, fm.up_off, fm.down_off};
             for (int r = 0; r < 3; ++r) {
                 // the handle is kept while consecutive roles share a file (every layer of a v3 pack)

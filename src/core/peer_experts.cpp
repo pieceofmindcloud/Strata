@@ -308,7 +308,7 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         // APR: Hadamard-folded gate/up take H (s * x); d_x_ is this device's private copy, rotated in place
         if (f.had_gu) strata::kernels::hadamard_rows(d_x_, d_x_, n_tok, H, f.had_block, d_sx_, s);
         strata::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
-        auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+        auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.u_type);
         if (f.had_d) { L.had_block = f.had_block; L.d_signs = d_sh_; }
         strata::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
                                                d_scratch_, d_out_, s);

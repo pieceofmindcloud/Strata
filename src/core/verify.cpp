@@ -2364,12 +2364,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
 #if STRATA_EXPERT_NIBBLE_BUILT
-                NativeExpertLayout L = vram && strata::core::nibble::layer(l).on
+                NativeExpertLayout L = vram && strata::core::nibble::layer(l).on && f.u_type == f.gu_type
                                            ? native_expert_layout_nib(f.gu_type, f.d_type, f.n_embd, f.n_ff)
-                                           : native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                                           : native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.u_type);
 #else
                 (void) vram;
-                NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.u_type);
 #endif
                 if (f.had_d) { L.had_block = f.had_block; L.d_signs = had_sh_; }   // APR: h is rotated in there
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,

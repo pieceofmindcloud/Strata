@@ -337,7 +337,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
             xe = d_xr_;
         }
         strata::kernels::quantize_q8_1_rows(xe, n_tok, H, d_q8_, s);
-        auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
+        auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff, fmt.u_type);
         if (fmt.had_d) { L.had_block = fmt.had_block; L.d_signs = d_sh_; }
         strata::kernels::native_expert_grouped(L, d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
                                                groups_, (int64_t) dst_.size(), d_q8_, d_scratch_, zero_copy_ && !reduce ? z_out_ : d_out_, s);

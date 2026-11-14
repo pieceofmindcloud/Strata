@@ -254,8 +254,22 @@ bool iq256_supported(int type) noexcept {
 
 bool kq256_supported(int type) noexcept { return type == 12 || type == 7 || type == 8; }
 
-bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
+bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err, int u_type) {
     init_once();
+    if (u_type < 0) u_type = gu_type;
+    if (u_type != gu_type) {
+        // A mixed layer (gate and up of different types): the two share one quantized activation, so both types must
+        // take the same vec_dot activation format; the trellis and NVFP4 types (scale tails, own kernels) are not mixed.
+        const ggml_type_traits_cpu* tgm = tq_supported(gu_type) ? nullptr : traits(gu_type);
+        const ggml_type_traits_cpu* tum = tq_supported(u_type) ? nullptr : traits(u_type);
+        if (tgm == nullptr || tum == nullptr || tgm->vec_dot == nullptr || tum->vec_dot == nullptr ||
+            gu_type == kNvfp4Type || u_type == kNvfp4Type || tgm->vec_dot_type != tum->vec_dot_type ||
+            n_embd % ggml_blck_size((ggml_type) u_type)) {
+            err = "native experts: gate type " + std::to_string(gu_type) + " and up type " + std::to_string(u_type) +
+                  " cannot share one layer (no dot product, or different activation formats)";
+            return false;
+        }
+    }
     // The trellis types (Gyro, ggml types 144-146) are not in a ggml built from upstream (and an upstream ggml indexes its
     // type table by the id, so asking it about 144 reads past the table): their geometry and activation format (Q8_0)
     // are known here, and their rows run on tq_cpu.hpp.
@@ -289,8 +303,10 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.n_ff = n_ff;
     f.gu_row = tq_g ? (size_t) (n_embd / kTqBlock) * tq_block_bytes(gu_type) : ggml_row_size((ggml_type) gu_type, n_embd);
     f.d_row = tq_d ? (size_t) (n_ff / kTqBlock) * tq_block_bytes(d_type) : ggml_row_size((ggml_type) d_type, n_ff);
+    f.u_type = u_type;
+    f.u_row = u_type == gu_type ? f.gu_row : ggml_row_size((ggml_type) u_type, n_embd);
     f.up_off = f.gu_row * (size_t) n_ff;
-    f.down_off = 2 * f.up_off;
+    f.down_off = f.up_off + f.u_row * (size_t) n_ff;
     f.bytes = f.down_off + f.d_row * (size_t) n_embd;
     // NVFP4 in any projection: one scale tail per blob; a mixed expert (e.g. NVFP4 gate/up + Q8_0 down) has 1.0 for
     // the other projection's scale (tools/iq_pack.py), so every path below multiplies by the tail unconditionally
@@ -454,6 +470,21 @@ int native_gu_mt_min(int gu_type) {
 template <NativeArithmetic Arithmetic>
 void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    if (native_mixed(f)) {   // a mixed layer: ggml-cpu's dot per projection, each with its own type and row bytes
+        const ggml_vec_dot_t dg = traits(f.gu_type)->vec_dot, du = traits(f.u_type)->vec_dot;
+        const int n = (int) f.n_embd;
+        for (int r = r0; r < r1; ++r) {
+            const uint8_t* gr = blob + (size_t) r * f.gu_row;
+            const uint8_t* ur = blob + f.up_off + (size_t) r * f.u_row;
+            for (int t = 0; t < nt; ++t) {
+                float g = 0.f, u = 0.f;
+                dg(n, &g, 0, gr, 0, act[t], 0, 1);
+                du(n, &u, 0, ur, 0, act[t], 0, 1);
+                ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+            }
+        }
+        return;
+    }
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the

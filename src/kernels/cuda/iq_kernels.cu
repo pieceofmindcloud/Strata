@@ -3361,12 +3361,12 @@ __global__ void dequant_flat_kernel(int ty, const void* __restrict__ vx, dst_t* 
 }
 // gate/up: superblock i of a role matrix (n_embd/256 per row) -> interleaved row 2r + parity
 __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const void* __restrict__ up, int64_t per_row,
-                                  __half* __restrict__ y, const float* __restrict__ tail) {
+                                  __half* __restrict__ y, const float* __restrict__ tail, int ty_up) {
     const int64_t i = blockIdx.x;
     const int parity = blockIdx.y;
     const int64_t r = i / per_row, c = i % per_row;
     __half* dst = y + ((2 * r + parity) * per_row + c) * QK_K;
-    dq_dispatch<__half>(ty, parity ? up : gate, i, dst, threadIdx.x);
+    dq_dispatch<__half>(parity ? ty_up : ty, parity ? up : gate, i, dst, threadIdx.x);
     if (tail != nullptr) {        // NVFP4: gate * s_gate, up * s_up (s_down on the down output: FP16 would underflow)
         __syncwarp();
         const float sc = parity ? tail[1] : tail[0];
@@ -5411,12 +5411,13 @@ void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream)
 }
 
 void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst, void* stream,
-                       const float* tail) {
+                       const float* tail, int up_type) {
+    if (up_type < 0) up_type = t;   // a mixed layer: the up rows dequantized with their own type
     // checked like the other entry points: an unknown type used to leave `dst` unwritten, a wrong prompt and no error
-    if (n_embd % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_gu_f16: type %d / %lld\n", t, (long long) n_embd); std::exit(1); }
+    if (n_embd % 256 != 0 || !is_iq(t) || !is_iq(up_type)) { std::fprintf(stderr, "iq_dequant_gu_f16: type %d/%d / %lld\n", t, up_type, (long long) n_embd); std::exit(1); }
     const int64_t per_row = n_embd / 256;
     dequant_gu_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(t, gate, up, per_row,
-                                                                                           (__half*) dst, tail);
+                                                                                           (__half*) dst, tail, up_type);
     check("iq_dequant_gu_f16");
 }
 
@@ -5477,14 +5478,23 @@ const float* hadamard_device_signs(const float* host, int width) {
     return d;
 }
 
-bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept {
+bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int u_type) noexcept {
+    // a mixed layer: each projection's type must be one the gate/up kernels take on its own
+    if (u_type >= 0 && u_type != gu_type && !native_expert_supported(u_type, d_type, n_embd, n_ff)) return false;
+    if (u_type >= 0 && u_type != gu_type && (gu_type == 40 || u_type == 40)) return false;
+    if (u_type >= 0 && u_type != gu_type) {
+        // native_expert_grouped's two passes read n_ff rows of the wider row size from up_off: inside the blob
+        const size_t gr = iq_row_bytes(gu_type, n_embd), ur = iq_row_bytes(u_type, n_embd), dr = iq_row_bytes(d_type, n_ff);
+        const size_t up = (size_t) n_ff * gr, end = up + (size_t) n_ff * ur + (size_t) n_embd * dr;
+        if (up + (size_t) n_ff * (gr > ur ? gr : ur) > end) return false;
+    }
     const int qg = gu_qk(gu_type), qd = d_qk(d_type);
     // a type without row bytes would make every row (and the up/down offsets) 0: refused, not run wrong
     return qg > 0 && qd > 0 && iq_row_bytes(gu_type, n_embd) > 0 && iq_row_bytes(d_type, n_ff) > 0 && is_iq(gu_type) && is_iq(d_type) && n_embd % qg == 0 && n_ff % qd == 0 &&
            n_embd % 256 == 0 && (n_ff * n_embd) % 256 == 0;
 }
 
-NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
+NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int u_type) {
     NativeExpertLayout L;
     L.gu_type = gu_type;
     L.d_type = d_type;
@@ -5494,6 +5504,11 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     L.d_row = iq_row_bytes(d_type, n_ff);
     L.up_off = (size_t) n_ff * L.gu_row;
     L.down_off = 2 * L.up_off;
+    if (u_type >= 0 && u_type != gu_type) {   // a mixed layer: the up rows have their own type and row bytes
+        L.u_type = u_type;
+        L.u_row = iq_row_bytes(u_type, n_embd);
+        L.down_off = L.up_off + (size_t) n_ff * L.u_row;
+    }
     L.bytes = L.down_off + (size_t) n_embd * L.d_row;
     // NVFP4: {s_gate, s_up, s_down, 0} after down (tools/iq_pack.py) whenever any projection is NVFP4; a mixed
     // expert's other projection has 1.0 there, so the kernels below multiply by it unconditionally
@@ -6282,6 +6297,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     float* h = (float*) ((uint8_t*) scratch + 2 * fa);
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
+    // A mixed layer (gate and up of different types, e.g. Unsloth UD's IQ2_S gate + IQ2_XXS up) takes only the generic
+    // gate/up kernel, twice (mixed_gu below); every specialized gate/up form assumes one type for both projections.
+    const bool mixed = L.u_type >= 0 && L.u_type != L.gu_type;
 #if !STRATA_EXPERT_NIBBLE_BUILT
     if (L.gu_nib) {   // STRATA_EXPERT_NIBBLE's slots: the switch is refused at start in a build without the kernels
         std::fprintf(stderr, "native_expert_grouped: 4-bit gate/up slots are not built into this engine\n");
@@ -6291,7 +6309,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     // STRATA_EXPERT_NIBBLE (nib_layout): only the gate/up step below takes another kernel (launch_gu_nib, in place of
     // launch_gu); SwiGLU, the q8_1 quantization and the down rows (GGUF, at L.down_off) are the layout's own
     static const bool v2 = [] { const char* v = std::getenv("STRATA_EXPERT_V2"); return v && v[0] == '1'; }();
-    if (v2 && !nib_layout(L) && L.gu_type == 21 && L.d_type == 20 && L.n_embd == 2560 && L.n_ff == 640) {   // S26: see s26_gu_l_kernel
+    if (v2 && !mixed && !nib_layout(L) && L.gu_type == 21 && L.d_type == 20 && L.n_embd == 2560 && L.n_ff == 640) {   // S26: see s26_gu_l_kernel
         // S26 STRATA_TSUM=1: the sums as one transposed butterfly per warp (s26_tsum.cuh; bitwise the same values)
         static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
         // (+ down rows' items spread evenly over the lanes, one load group: bitwise, harness 1.09-1.12x vs 1.03-1.06x;
@@ -6330,7 +6348,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }();
     // Qwen3.6-35B-A3B (n_embd 2048, n_ff 512, Q4_K / Q5_K gate+up, Q5_K down): the same kernels, the geometry only sizes the grid
     const bool q36geo = L.n_embd == 2048 && L.n_ff == 512 && L.d_type == 13;
-    if (v2k && (L.gu_type == 12 || L.gu_type == 13) &&
+    if (v2k && !mixed && (L.gu_type == 12 || L.gu_type == 13) &&
         (((L.d_type == 7 || L.d_type == 8) && L.n_embd == 2560 && L.n_ff == 640) || q36geo)) {
         static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
         const long long nh = (long long) cap_entries * L.n_ff;
@@ -6368,7 +6386,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
 #endif
 #if STRATA_EXP_LAYOUTS
-    const bool fused_gu = !nib_layout(L) && em0 == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23) &&
+    const bool fused_gu = !mixed && !nib_layout(L) && em0 == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23) &&
                           L.n_ff % 32 == 0;
     if (fused_gu && g_exp_phase != 2) {
         const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
@@ -6390,7 +6408,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #else
     const bool gs_layout = true;
 #endif
-    if (gs_layout && !nib_layout(L) && g_exp_phase == 0 && !v1 && gu_swiglu_on() && !(expdec_mode() && !g_old_kernels && expdec_gu_ok(L))) {
+    if (gs_layout && !mixed && !nib_layout(L) && g_exp_phase == 0 && !v1 && gu_swiglu_on() && !(expdec_mode() && !g_old_kernels && expdec_gu_ok(L))) {
         switch (L.gu_type) {
 #define STRATA_GS(T) case T: gs_done = launch_gu_swiglu<T>(L, gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, hq); break;
             STRATA_GU_FMTS(STRATA_GS)
@@ -6413,7 +6431,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     if (g_exp_phase != 2 && !gs_done) {
 #endif
 #if STRATA_EXP_LAYOUTS
-    const bool lds_gu = !nib_layout(L) && (em0 == 5 || em0 == 6 || em0 == 7 || em0 == 8) && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23);
+    const bool lds_gu = !mixed && !nib_layout(L) && (em0 == 5 || em0 == 6 || em0 == 7 || em0 == 8) && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23);
     if (lds_gu) {
         const dim3 gl((unsigned) ((2 * L.n_ff + LDS_RB - 1) / LDS_RB), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
@@ -6434,7 +6452,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     // the AMD layouts cover the IQ packs' gate/up types; Unsloth's Q4_K / Q5_K take the CUDA layout below
     const bool amd_gu = L.gu_type == 16 || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 ||
                         L.gu_type == 23 || L.gu_type == 29 || L.gu_type == 42;
-    if ((em == 1 || em == 2 || em == 4) && amd_gu && !nib_layout(L)) {
+    if ((em == 1 || em == 2 || em == 4) && amd_gu && !mixed && !nib_layout(L)) {
         switch (L.gu_type) {
             STRATA_GU_AMD(16) STRATA_GU_AMD(17) STRATA_GU_AMD(18) STRATA_GU_AMD(21) STRATA_GU_AMD(22) STRATA_GU_AMD(23)
             STRATA_GU_AMD(29) STRATA_GU_AMD(42)
@@ -6448,6 +6466,33 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                       n_groups, ent_tok, X, gate, up);
     else
 #endif
+    if (mixed) {
+        // Two passes of the generic kernel over the 2 * n_ff rows. Pass 1 reads the blob with the gate's type: its gate
+        // rows are right, its "up" rows (the up bytes read as the gate's type) go to h, which is free until SwiGLU.
+        // Pass 2 reads with the up's type and row bytes, the up rows at up_off: its up rows are right, its "gate" rows
+        // go to h too. Both passes stay inside the blob: pass 1's second half ends at up_off + n_ff * gu_row and pass
+        // 2's at up_off + n_ff * u_row, both within [0, down_off + down bytes) (checked at layout time, mixed_gu_fits).
+        NativeExpertLayout Lu = L;
+        Lu.gu_type = L.u_type;
+        Lu.gu_row = L.u_row;
+        auto grid_for = [&](int t) {
+            const int rows = (!g_old_kernels && !g_no_sub16_gu && L.n_embd == 2560 && gu_split(t) && gu_qk(t) != 128 &&
+                              t != 12 && t != 13) ? 16 : GU_ROWS;
+            return dim3((unsigned) ((2 * L.n_ff + rows - 1) / rows), (unsigned) gy);
+        };
+        switch (L.gu_type) {
+#define STRATA_GU(T) case T: launch_gu<T>(grid_for(T), s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, h); break;
+            STRATA_GU_FMTS(STRATA_GU)
+#undef STRATA_GU
+            default: std::fprintf(stderr, "native_expert_grouped: gate type %d\n", L.gu_type); std::exit(1);
+        }
+        switch (L.u_type) {
+#define STRATA_GU(T) case T: launch_gu<T>(grid_for(T), s, grp_ptr, grp_start, n_groups, ent_tok, X, Lu, h, up); break;
+            STRATA_GU_FMTS(STRATA_GU)
+#undef STRATA_GU
+            default: std::fprintf(stderr, "native_expert_grouped: up type %d\n", L.u_type); std::exit(1);
+        }
+    } else
     if (!expdec_gu(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up))   // STRATA_EXPDEC=1
     switch (L.gu_type) {
 #define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;

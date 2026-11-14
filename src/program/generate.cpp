@@ -4776,7 +4776,7 @@ int main(int argc, char** argv) {
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
             if (stage_mode && (l < o.stage_lo || l >= o.stage_hi)) continue;   // another stage's layer
             const auto& f = lay.fmt[(size_t) l];
-            if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
+            if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.u_type)) {
                 std::fprintf(stderr, "strata generate: layer %lld's experts are %s/%s (ggml types %d/%d), which this "
                                      "engine has no GPU kernels for\n", (long long) l,
                              strata::ggml_type_name((uint32_t) f.gu_type), strata::ggml_type_name((uint32_t) f.d_type),

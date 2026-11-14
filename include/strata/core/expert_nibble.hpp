@@ -346,7 +346,9 @@ inline std::vector<LayerVram> plan_layers(const strata::kernels::cpu::ExpertLayo
     const Config& c = config();
     std::vector<LayerVram> out((size_t) (lay.n_layers > 0 ? lay.n_layers : 0));
     for (int64_t l = 0; l < (int64_t) out.size(); ++l) {
-        if (lay.native && (size_t) l < lay.fmt.size()) out[(size_t) l] = plan_layer(l, lay.fmt[(size_t) l], c);
+        // a mixed layer (gate and up of different types) keeps its GGUF rows: the 4-bit slot holds one gate/up format
+        if (lay.native && (size_t) l < lay.fmt.size() && !strata::kernels::cpu::native_mixed(lay.fmt[(size_t) l]))
+            out[(size_t) l] = plan_layer(l, lay.fmt[(size_t) l], c);
         else out[(size_t) l].slot_bytes = out[(size_t) l].raw_bytes = lay.blob_bytes(l);
     }
     if (c.on && !lay.native) err = "STRATA_EXPERT_NIBBLE needs a native pack (native_experts.txt)";

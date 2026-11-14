@@ -386,7 +386,7 @@ inline bool fused_ring() {
     if (known != 0) return known == 1;
     bool all = !lay.fmt.empty();
     for (const auto& f : lay.fmt)
-        if (!fused::native_supported(f.gu_type, f.d_type)) { all = false; break; }
+        if (strata::kernels::cpu::native_mixed(f) || !fused::native_supported(f.gu_type, f.d_type)) { all = false; break; }
     per_dev[dev].store(all ? 1 : 2, std::memory_order_relaxed);
     return all;
 }
@@ -1543,6 +1543,13 @@ const MmqPlan& mmq_plan() {
         };
         for (int64_t l = 0; on && l < layers; ++l) {
             const int gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42, dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
+            // a mixed layer (gate and up of different types): MMQ, WMMA and the fused kernels take one gate/up format,
+            // the FP16 path dequantizes each projection with its own type (iq_dequant_gu_f16's up_type)
+            if (lay.native && strata::kernels::cpu::native_mixed(lay.fmt[(size_t) l])) {
+                p.fallback = true;
+                mf_note("fp16-gemm", "gate and up have different formats (a mixed layer)", gt, dt);
+                continue;
+            }
             // #420: a tile on every GPU for these shapes (gate+up: 1280 rows, down: N rows), else the FP16 path
             if (!mmq::fits(gt, kFF2) || !mmq::fits(dt, N)) {
                 // pf_wmma: a format dq_dispatch takes (IQ1_M, an IQ4_NL down) rides the MMQ grouping, computed by the WMMA tiles only
@@ -6002,7 +6009,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const auto& f = lay.fmt[(size_t) l];
                                 strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
                                                                    m.dq_gu[q], m.cs,
-                                                                   f.tail_off ? (const float*) (blob_dev + f.tail_off) : nullptr);
+                                                                   f.tail_off ? (const float*) (blob_dev + f.tail_off) : nullptr,
+                                                                   f.u_type);
                                 strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs,
                                                                 f.tail_off ? (const float*) (blob_dev + f.tail_off) + 2 : nullptr);
                             } else {
@@ -7279,7 +7287,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                     if (lay.native) {
                         const auto& f = lay.fmt[(size_t) l];
                         strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
-                                                           m.dq_gu[dq], cs, nullptr);
+                                                           m.dq_gu[dq], cs, nullptr, f.u_type);
                         strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[dq], cs,
                                                         nullptr);
                     } else {
