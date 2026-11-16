@@ -22,7 +22,7 @@ void missing(const char* name);
 
 namespace strata::kernels {
 void iq_dequant_f16(int, const void*, int64_t, uint16_t*, void*, const float*) { strata::metal_engine::missing("strata::kernels::iq_dequant_f16(scale)"); }
-void iq_dequant_gu_f16(int, const void*, const void*, int64_t, int64_t, uint16_t*, void*, const float*) { strata::metal_engine::missing("strata::kernels::iq_dequant_gu_f16(tail)"); }
+void iq_dequant_gu_f16(int, const void*, const void*, int64_t, int64_t, uint16_t*, void*, const float*, int) { strata::metal_engine::missing("strata::kernels::iq_dequant_gu_f16(tail)"); }
 bool gdn_commit_layers(float*, int64_t, int64_t, const float*, int64_t, const float*, int64_t, const float*, const float*, int64_t,
                        int, int, int, int, int, const int32_t*, void*) { return false; }   // "nothing launched: keep the per-layer loop"
 void native_qsa_indexer_append_steps_layers(const float*, int64_t, const int32_t*, int, int, int32_t, float, const QsaIndexerLayers&, int,
