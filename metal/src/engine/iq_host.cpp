@@ -71,13 +71,15 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
     }
 }
 
-bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept {
+bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int u_type) noexcept {
+    // a mixed layer (gate and up of different types) has no Metal kernels yet: the layer is refused at startup
+    if (u_type >= 0 && u_type != gu_type) return false;
     const int qg = gu_qk(gu_type), qd = d_qk(d_type);
     return qg > 0 && qd > 0 && (is_iq(gu_type) || is_tq(gu_type)) && (is_iq(d_type) || is_tq(d_type)) && n_embd % qg == 0 && n_ff % qd == 0 &&
            n_embd % 256 == 0 && (n_ff * n_embd) % 256 == 0;   // (the trellis rows: 128-value blocks, 2560 = 20, 640 = 5)
 }
 
-NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
+NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int u_type) {
     NativeExpertLayout L;
     L.gu_type = gu_type;
     L.d_type = d_type;
@@ -87,6 +89,11 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     L.d_row = iq_row_bytes(d_type, n_ff);
     L.up_off = (size_t) n_ff * L.gu_row;
     L.down_off = 2 * L.up_off;
+    if (u_type >= 0 && u_type != gu_type) {   // a mixed layer: the up rows have their own type and row bytes
+        L.u_type = u_type;
+        L.u_row = iq_row_bytes(u_type, n_embd);
+        L.down_off = L.up_off + (size_t) n_ff * L.u_row;
+    }
     L.bytes = L.down_off + (size_t) n_embd * L.d_row;
     return L;
 }
